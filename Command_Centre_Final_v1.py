@@ -385,7 +385,7 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
 print(f"Processed dashboard saved to {output_path}")
 
 # --- Export all to SQLite via SQLAlchemy ---
-db_path = r"C:\Users\edmichaeljoil.fajard\Documents\CBPS - Command Centre Dashboard\Processed_Data_DB.db"
+db_path = os.path.join(os.path.dirname(__file__), "data", "Processed_Data_DB.db")
 
 engine = create_engine(f"sqlite:///{db_path}", echo=False)
 
@@ -412,5 +412,6 @@ df_exec_sql.to_sql("executive_view", engine, if_exists="replace", index=False)
 df_calendar_sql.to_sql("calendar_of_events", engine, if_exists="replace", index=False)
 
 print(f"SQLite database saved to {db_path}")
+
 
 
