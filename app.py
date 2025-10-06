@@ -23,14 +23,14 @@ def delayed_run():
     with lock:
         preprocess_timer = None
     try:
-        # venv Python path
-        venv_python = r"C:\Users\edmichaeljoil.fajard\PythonVSCode\cc-dashboard\.venv\Scripts\python.exe"
+        venv_python = os.path.join(os.path.dirname(__file__), "venv/bin/python3")
+        script_path = os.path.join(os.path.dirname(__file__), "Command_Centre_Final_v1.py")
 
         result = subprocess.run(
-            [venv_python, "Command_Centre_Final_v1.py"],
+            [venv_python, script_path],
             capture_output=True,
             text=True,
-            cwd=r"C:\Users\edmichaeljoil.fajard\PythonVSCode\Command_Centre"  # script folder
+            cwd=os.path.dirname(__file__)
         )
 
         print("Preprocessing script executed")
@@ -97,3 +97,4 @@ def run_preprocessing():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
