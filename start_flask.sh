@@ -7,7 +7,7 @@
 set -e  # stop on error
 
 APP_DIR="/opt/command_centre"
-REPO_URL="https://gitlab.com/your-team/command-centre-automation.git"  # <-- update this
+REPO_URL="https://github.com/edmichaeljoilfajardo-cgi/command_centre_final.git"  # <-- update this
 VENV_DIR="$APP_DIR/venv"
 PYTHON=$(which python3)
 
