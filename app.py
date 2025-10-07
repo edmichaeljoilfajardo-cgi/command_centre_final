@@ -7,7 +7,7 @@ import subprocess, threading, time
 app = Flask(__name__)
 
 # URL prefix for Apache reverse proxy
-api_bp = Blueprint('api', __name__)
+api_bp = Blueprint('api', __name__, url_prefix='/command_centre')
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -86,5 +86,6 @@ app.register_blueprint(api_bp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
 
