@@ -17,25 +17,38 @@ print("Files in uploads:", os.listdir(UPLOAD_DIR))
 preprocess_timer = None
 lock = threading.Lock()
 
-def delayed_run():
-    """Run the preprocessing script after cooldown expires"""
+def schedule_preprocessing():
+    """Cancel any existing timer and schedule a new one."""
     global preprocess_timer
-    time.sleep(60)
     with lock:
-        preprocess_timer = None
-    try:
-        venv_python = "/usr/bin/python3"  # adjust if using virtualenv
-        result = subprocess.run(
-            [venv_python, "Command_Centre_Final_v1.py"],
-            capture_output=True,
-            text=True,
-            cwd="/opt/command_centre_final"
-        )
-        print("Preprocessing script executed")
-        print("STDOUT:", result.stdout)
-        print("STDERR:", result.stderr)
-    except Exception as e:
-        print("Error running preprocessing script:", str(e))
+        if preprocess_timer is not None:
+            print("Existing timer found, cancelling previous schedule.")
+            preprocess_timer.cancel()
+
+        def run_after_delay():
+            print("Delay complete. Starting preprocessing script...")
+            try:
+                venv_python = "/usr/bin/python3"  # or your venv if needed
+                result = subprocess.run(
+                    [venv_python, "Command_Centre_Final_v1.py"],
+                    capture_output=True,
+                    text=True,
+                    cwd="/opt/command_centre"
+                )
+                print("Preprocessing script executed")
+                print("STDOUT:", result.stdout)
+                print("STDERR:", result.stderr)
+            except Exception as e:
+                print("Error running preprocessing script:", str(e))
+
+            with lock:
+                preprocess_timer = None
+
+        # Start timer in a *detached background thread*
+        preprocess_timer = threading.Timer(60, run_after_delay)
+        preprocess_timer.daemon = True  # ensures thread continues in background
+        preprocess_timer.start()
+        print("Preprocessing scheduled in 60 seconds.")
 
 @api_bp.route("/api/command_centre", methods=["POST"])
 def command_centre():
@@ -70,12 +83,8 @@ def command_centre():
 
 @api_bp.route("/api/run_preprocessing", methods=["POST"])
 def run_preprocessing():
-    global preprocess_timer
-    with lock:
-        if preprocess_timer is not None:
-            preprocess_timer.cancel()
-        preprocess_timer = threading.Timer(60, delayed_run)
-        preprocess_timer.start()
+    """Endpoint to (re)schedule preprocessing with a cooldown"""
+    schedule_preprocessing()
     return jsonify({
         "status": "scheduled",
         "message": "Preprocessing will run in 1 minute if no new files arrive"
@@ -90,6 +99,7 @@ app.register_blueprint(api_bp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
