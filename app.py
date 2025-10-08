@@ -81,11 +81,16 @@ def run_preprocessing():
         "message": "Preprocessing will run in 1 minute if no new files arrive"
     }), 200
 
+@api_bp.route("/api/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "ok", "message": "Command Centre API is running"}), 200
+
 # Register blueprint
 app.register_blueprint(api_bp)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
 
 
