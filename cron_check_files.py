@@ -25,6 +25,7 @@ def download_and_trigger():
             name = f["filename"]
             url = f["url"]
             print(f"Downloading {name}...")
+            print("Download URL:", url)
             dl = requests.get(url, timeout=60)
             if dl.status_code == 200:
                 local_path = os.path.join(UPLOADS_DIR, name)
@@ -44,5 +45,6 @@ def download_and_trigger():
 
 if __name__ == "__main__":
     download_and_trigger()
+
 
 
