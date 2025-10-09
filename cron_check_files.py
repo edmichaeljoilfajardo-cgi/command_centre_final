@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/opt/command_centre/venv/bin/python
 import requests, os, time, subprocess
 
 # === CONFIGURATION ===
@@ -49,7 +49,8 @@ def run_preprocessing():
     try:
         log("Starting preprocessing...")
         result = subprocess.run(
-            ["/usr/bin/python3", PREPROCESS_SCRIPT],
+            ["/opt/command_centre/venv/bin/python", PREPROCESS_SCRIPT],
+
             capture_output=True,
             text=True,
             cwd="/opt/command_centre"
@@ -72,3 +73,4 @@ if __name__ == "__main__":
     else:
         log("No files downloaded. Skipping preprocessing.")
     log("===== Cron Job Finished =====\n")
+
