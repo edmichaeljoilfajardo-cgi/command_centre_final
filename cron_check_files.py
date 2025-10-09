@@ -2,8 +2,7 @@
 import requests, os, time
 
 FUNCTION_KEY = os.getenv("GET_FILES_KEY")
-# === CONFIGURATION ===
-GET_FILES_URL = "https://forward-pass-hweec7daafebhqfy.canadacentral-01.azurewebsites.net/api/getNewFiles?code={FUNCTION_KEY}"
+GET_FILES_URL = f"https://forward-pass-hweec7daafebhqfy.canadacentral-01.azurewebsites.net/api/getNewFiles?code={FUNCTION_KEY}"
 UPLOADS_DIR = "/opt/command_centre/uploads"
 FLASK_API = "http://127.0.0.1:5000/command_centre/api/run_preprocessing"
 
@@ -45,4 +44,5 @@ def download_and_trigger():
 
 if __name__ == "__main__":
     download_and_trigger()
+
 
