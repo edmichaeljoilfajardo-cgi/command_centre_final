@@ -384,11 +384,30 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     
 print(f"Processed dashboard saved to {output_path}")
 
-# --- Export all to SQLite via SQLAlchemy ---
-db_path = os.path.join(os.path.dirname(__file__), "data", "Processed_Data_DB.db")
+# --- Export to both SQLite and PostgreSQL via SQLAlchemy ---
 
-engine = create_engine(f"sqlite:///{db_path}", echo=False)
+# --- SQLite (local backup) ---
+sqlite_path = os.path.join(os.path.dirname(__file__), "data", "Processed_Data_DB.db")
+sqlite_engine = create_engine(f"sqlite:///{sqlite_path}", echo=False)
 
+# --- PostgreSQL (Minikube database) ---
+POSTGRES_USER = "cc_pipeline_user"
+POSTGRES_PASSWORD = "admin"
+POSTGRES_DB = "command_centre"
+POSTGRES_HOST = "localhost"    # Python runs on the host
+POSTGRES_PORT = "30032"        # NodePort from your YAML
+
+try:
+    postgres_engine = create_engine(
+        f"postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}",
+        echo=False
+    )
+    print("PostgreSQL connection initialized.")
+except Exception as e:
+    postgres_engine = None
+    print("Could not connect to PostgreSQL:", e)
+
+# --- Clean up column names ---
 def sanitize_columns(df):
     df = df.copy()
     df.columns = [
@@ -398,20 +417,38 @@ def sanitize_columns(df):
     ]
     return df
 
-df_gdc_sql   = sanitize_columns(df_gdc)
-df_hnw_sql   = sanitize_columns(df_hnw)
-df_users_sql = sanitize_columns(df_users)
-df_exec_sql  = sanitize_columns(df_exec)
-df_calendar_sql = sanitize_columns(df_calendar)
+# --- Prepare all DataFrames ---
+df_dict = {
+    "gdc_gta": sanitize_columns(df_gdc),
+    "hnw": sanitize_columns(df_hnw),
+    "users_productivity": sanitize_columns(df_users),
+    "executive_view": sanitize_columns(df_exec),
+    "calendar_of_events": sanitize_columns(df_calendar)
+}
 
-# overwrite tables each run
-df_gdc_sql.to_sql("gdc_gta", engine, if_exists="replace", index=False)
-df_hnw_sql.to_sql("hnw", engine, if_exists="replace", index=False)
-df_users_sql.to_sql("users_productivity", engine, if_exists="replace", index=False)
-df_exec_sql.to_sql("executive_view", engine, if_exists="replace", index=False)
-df_calendar_sql.to_sql("calendar_of_events", engine, if_exists="replace", index=False)
+# --- Function to save to both databases ---
+def save_to_databases(df_dict, sqlite_engine, postgres_engine=None):
+    for name, df in df_dict.items():
+        try:
+            # Save to SQLite
+            df.to_sql(name, sqlite_engine, if_exists="replace", index=False)
+            print(f"Saved '{name}' to SQLite")
 
-print(f"SQLite database saved to {db_path}")
+            # Save to PostgreSQL (if available)
+            if postgres_engine:
+                df.to_sql(name, postgres_engine, if_exists="replace", index=False)
+                print(f"Saved '{name}' to PostgreSQL")
+        except Exception as e:
+            print(f"Error saving '{name}':", e)
+
+# --- Execute save ---
+save_to_databases(df_dict, sqlite_engine, postgres_engine)
+
+print(f"SQLite database saved to {sqlite_path}")
+if postgres_engine:
+    print("PostgreSQL export completed successfully.")
+
+
 
 
 
