@@ -394,7 +394,7 @@ sqlite_engine = create_engine(f"sqlite:///{sqlite_path}", echo=False)
 POSTGRES_USER = "cc_pipeline_user"
 POSTGRES_PASSWORD = "admin"
 POSTGRES_DB = "command_centre"
-POSTGRES_HOST = "localhost"    # Python runs on the host
+POSTGRES_HOST = "192.168.49.2"    # Python runs on the host
 POSTGRES_PORT = "30032"        # NodePort from your YAML
 
 try:
@@ -447,6 +447,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
