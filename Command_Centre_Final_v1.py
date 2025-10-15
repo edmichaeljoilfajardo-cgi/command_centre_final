@@ -373,7 +373,7 @@ df_users = process_users_productivity()
 df_calendar = process_calendar_events()
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-output_path = rf"C:\Users\edmichaeljoil.fajard\Documents\CBPS - Command Centre Dashboard\Processed_Dashboard_Output_{timestamp}.xlsx"
+output_path = rf"C:\Users\edmichaeljoil.fajard\Documents\CBPS - Command Centre Dashboard\Processed_Dashboard_Output.xlsx"
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     df_gdc.to_excel(writer, index=False, sheet_name="CC Full View of GDC+GTA screen1")
@@ -447,6 +447,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
