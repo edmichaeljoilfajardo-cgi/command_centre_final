@@ -33,9 +33,9 @@ def safe_numeric(series_or_scalar, output_df):
     return pd.to_numeric(series_or_scalar, errors="coerce").fillna(0)
 
 dump_wb = pd.ExcelFile(data_dump_path)
-data_dump_df = pd.read_excel(dump_wb, sheet_name="original data dump")
+data_dump_df = pd.read_excel(dump_wb, sheet_name="ag-grid")
 
-reso_df = pd.read_excel(reso_dump_path, sheet_name="Original Data Dump")
+reso_df = pd.read_excel(reso_dump_path, sheet_name="ag-grid")
 reso_map_df = pd.read_excel(reso_map_path, sheet_name="Added by Charmaine")
 
 pro_pf_df = pd.read_excel(pro_pf_path)
@@ -447,6 +447,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
