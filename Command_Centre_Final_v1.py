@@ -52,8 +52,38 @@ data_dump_df["Lock Status"] = (
     .replace({"Y": "LOCKED", "LOCKED": "LOCKED"})
 )
 
-def map_personal_folder_counts(folder_df, reso_map_df):
-    counts = folder_df.groupby("Doc Type")["Document ID"].nunique().reset_index(name="PFCount")
+def map_personal_folder_counts_pro(folder_df):
+    """
+    Compute number of unique Document IDs per Queue directly from the Personal Folder dump.
+    """
+    folder_df = folder_df.copy()
+    folder_df["Queue"] = folder_df["Queue"].astype(str).str.strip()
+
+    counts = (
+        folder_df.groupby("Queue")["Document ID"]
+        .nunique()
+        .reset_index(name="PFCount")
+    )
+
+    # Return as a dictionary {QueueName: Count}
+    return counts.set_index("Queue")["PFCount"].to_dict()
+
+def map_personal_folder_counts_reso(folder_df, reso_map_df):
+    """
+    For RESO Personal Folder dump — map Doc Type to Queue Description.
+    Returns a dict: {Queue_Desc: unique document count}
+    """
+    folder_df = folder_df.copy()
+    folder_df["Doc Type"] = folder_df["Doc Type"].astype(str).str.strip()
+    reso_map_df["Doc_Type"] = reso_map_df["Doc_Type"].astype(str).str.strip()
+    reso_map_df["Queue_Desc"] = reso_map_df["Queue_Desc"].astype(str).str.strip()
+
+    counts = (
+        folder_df.groupby("Doc Type")["Document ID"]
+        .nunique()
+        .reset_index(name="PFCount")
+    )
+
     mapped = pd.merge(
         counts,
         reso_map_df[["Doc_Type", "Queue_Desc"]],
@@ -61,6 +91,7 @@ def map_personal_folder_counts(folder_df, reso_map_df):
         right_on="Doc_Type",
         how="left"
     )
+
     return mapped.groupby("Queue_Desc")["PFCount"].sum().to_dict()
 
 # Helper to compute PRO and QC Backlogs (with totals by category)
@@ -301,15 +332,19 @@ def process_layout_sheet(sheet_name, category_headers):
         reso_final_counts = reso_with_desc.groupby("Queue_Desc")["ResoCount"].sum().to_dict()
         output_df["Reso Queue"] = output_df["QueueName"].map(reso_final_counts).fillna(0).astype(int)
 
-    # ✅ PRO Personal Folders
-    pro_pf_counts = map_personal_folder_counts(pro_pf_df, reso_map_df)
+    # PRO Personal Folders (direct queue-based)
+    pro_pf_counts = map_personal_folder_counts_pro(pro_pf_df)
     if "PRO Personal Folders" in output_df.columns:
-        output_df["PRO Personal Folders"] = output_df["QueueName"].map(pro_pf_counts).fillna(0).astype(int)
+        output_df["PRO Personal Folders"] = (
+            output_df["QueueName"].map(pro_pf_counts).fillna(0).astype(int)
+        )
 
-    # ✅ RESO Personal Folders
-    reso_pf_counts = map_personal_folder_counts(reso_pf_df, reso_map_df)
+    # RESO Personal Folders (Doc Type → Queue mapping)
+    reso_pf_counts = map_personal_folder_counts_reso(reso_pf_df, reso_map_df)
     if "RESO Personal Folders" in output_df.columns:
-        output_df["RESO Personal Folders"] = output_df["QueueName"].map(reso_pf_counts).fillna(0).astype(int)
+        output_df["RESO Personal Folders"] = (
+            output_df["QueueName"].map(reso_pf_counts).fillna(0).astype(int)
+        )
 
     output_df["Resolutions Completed Volumes"] = 0
     output_df["SLA % Completed"] = 0
@@ -693,7 +728,7 @@ def save_to_databases(df_dict, sqlite_engine, postgres_engine=None):
         try:
             # Save to SQLite
             df.to_sql(name, sqlite_engine, if_exists="replace", index=False)
-            print(f"Saved '{name}' to SQLite")
+            #print(f"Saved '{name}' to SQLite")
 
             # Save to PostgreSQL (if available)
             if postgres_engine:
@@ -708,8 +743,6 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
-
-
 
 
 
