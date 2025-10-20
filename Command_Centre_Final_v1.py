@@ -18,7 +18,7 @@ reso_pf_path = os.path.join(UPLOAD_DIR, "ECISS Resolutions Personal Folder.xlsx"
 
 calendar_path = os.path.join(UPLOAD_DIR, "Calendar of Events.xlsx")
 
-prod_extract_path = os.path.join(UPLOAD_DIR, "Productivity Extract.xlsx")
+prod_extract_path = os.path.join(UPLOAD_DIR, "Productivity Extract.csv")
 
 def clean_columns(df):
     df.columns = (
@@ -175,7 +175,7 @@ def compute_backlogs(data_dump_df, layout_path):
 # Helper to load and summarize Productivity Extract
 def load_productivity_extract():
     try:
-        prod_df = pd.read_excel(prod_extract_path, header=None)
+        prod_df = pd.read_csv(prod_extract_path, header=None)
 
         # Columns: D (QueueName), E (Accepted), F (Processed), W (QC Pass), X (QC Error)
         prod_df = prod_df.iloc[:, [3, 4, 5, 22, 23]]
@@ -708,6 +708,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
