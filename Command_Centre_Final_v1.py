@@ -18,6 +18,8 @@ reso_pf_path = os.path.join(UPLOAD_DIR, "ECISS Resolutions Personal Folder.xlsx"
 
 calendar_path = os.path.join(UPLOAD_DIR, "Calendar of Events.xlsx")
 
+prod_extract_path = os.path.join(UPLOAD_DIR, "Productivity Extract.xlsx")
+
 def clean_columns(df):
     df.columns = (
         df.columns.astype(str)
@@ -60,6 +62,165 @@ def map_personal_folder_counts(folder_df, reso_map_df):
         how="left"
     )
     return mapped.groupby("Queue_Desc")["PFCount"].sum().to_dict()
+
+# Helper to compute PRO and QC Backlogs (with totals by category)
+def compute_backlogs(data_dump_df, layout_path):
+    # --- Step 1. Compute base backlog counts ---
+    df = data_dump_df.copy()
+    df["Entry Date"] = pd.to_datetime(df["Entry Date"], errors="coerce")
+    today = pd.Timestamp.now().normalize()
+    backlog_df = df[df["Entry Date"] < today]
+
+    backlog_df["Is_QC"] = backlog_df["Queue"].astype(str).str.endswith("QC", na=False)
+
+    pro_backlogs = (
+        backlog_df[~backlog_df["Is_QC"]]
+        .groupby("Queue")["Document ID"]
+        .nunique()
+        .reset_index(name="PRO Backlogs")
+    )
+
+    qc_backlogs = (
+        backlog_df[backlog_df["Is_QC"]]
+        .groupby("Queue")["Document ID"]
+        .nunique()
+        .reset_index(name="QC Backlogs")
+    )
+    qc_backlogs["Queue"] = qc_backlogs["Queue"].str.replace(r"QC$", "", regex=True).str.strip()
+
+    backlog_summary = pd.merge(pro_backlogs, qc_backlogs, on="Queue", how="outer").fillna(0)
+    backlog_summary = backlog_summary.rename(columns={"Queue": "QueueName"})
+    backlog_summary["PRO Backlogs"] = backlog_summary["PRO Backlogs"].astype(int)
+    backlog_summary["QC Backlogs"] = backlog_summary["QC Backlogs"].astype(int)
+
+    # --- Step 2. Load the layout template for ordering ---
+    layout_wb = pd.ExcelFile(layout_path)
+    layout_df = pd.read_excel(layout_wb, sheet_name="Backlogs", header=None)
+
+    header_row_idx = layout_df[layout_df.apply(
+        lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(),
+        axis=1
+    )].index[0]
+
+    layout_columns = layout_df.iloc[header_row_idx].tolist()
+    layout_columns = [str(c).strip().replace("\xa0", " ") for c in layout_columns]
+
+    formatted_backlogs = layout_df.iloc[header_row_idx + 1:].reset_index(drop=True)
+    formatted_backlogs.columns = layout_columns
+
+    if "QueueName" not in formatted_backlogs.columns:
+        formatted_backlogs.insert(0, "QueueName", layout_df.iloc[header_row_idx + 1:, 0].reset_index(drop=True))
+
+    formatted_backlogs["QueueName"] = formatted_backlogs["QueueName"].astype(str).str.strip()
+
+    # --- Step 3. Map actual backlog values ---
+    formatted_backlogs["PRO Backlogs"] = formatted_backlogs["QueueName"].map(
+        backlog_summary.set_index("QueueName")["PRO Backlogs"]
+    ).fillna(0).astype(int)
+
+    formatted_backlogs["QC Backlogs"] = formatted_backlogs["QueueName"].map(
+        backlog_summary.set_index("QueueName")["QC Backlogs"]
+    ).fillna(0).astype(int)
+
+    # --- Step 4. Define category totals ---
+    category_headers = [
+        "FINANCIAL - Total",
+        "QUASI NON-FINANCIAL - Total",
+        "NON-FINANCIAL - Total",
+        "Other - Total",
+    ]
+
+    queue_to_category = {}
+    current_cat = None
+    for q in formatted_backlogs["QueueName"]:
+        if q in category_headers:
+            current_cat = q
+        elif q == "Grand Total by Queue:":
+            continue
+        elif current_cat is not None:
+            queue_to_category[q] = current_cat
+
+    formatted_backlogs["Category"] = formatted_backlogs["QueueName"].map(queue_to_category)
+
+    # --- Step 5. Roll up totals per category ---
+    for cat in category_headers:
+        child_rows = formatted_backlogs[formatted_backlogs["Category"] == cat]
+        pro_sum = child_rows["PRO Backlogs"].sum()
+        qc_sum = child_rows["QC Backlogs"].sum()
+        formatted_backlogs.loc[formatted_backlogs["QueueName"] == cat, "PRO Backlogs"] = pro_sum
+        formatted_backlogs.loc[formatted_backlogs["QueueName"] == cat, "QC Backlogs"] = qc_sum
+
+    # --- Step 6. Grand total ---
+    grand_sources = set(category_headers) | {"Other - Total"}
+    grand_totals = formatted_backlogs.loc[
+        formatted_backlogs["QueueName"].isin(grand_sources), ["PRO Backlogs", "QC Backlogs"]
+    ].sum()
+
+    formatted_backlogs.loc[
+        formatted_backlogs["QueueName"] == "Grand Total by Queue:", ["PRO Backlogs", "QC Backlogs"]
+    ] = grand_totals.values
+
+    # --- Step 7. Cleanup ---
+    formatted_backlogs = formatted_backlogs.drop(columns=["Category"], errors="ignore")
+    formatted_backlogs = formatted_backlogs.fillna(0)
+
+    # Drop duplicate QueueName column if both exist
+    if "QueueName" in formatted_backlogs.columns and "CI GTA & GDC Queue Volumes" in formatted_backlogs.columns:
+        if formatted_backlogs["QueueName"].equals(formatted_backlogs["CI GTA & GDC Queue Volumes"]):
+            formatted_backlogs = formatted_backlogs.drop(columns=["QueueName"])
+
+
+    return formatted_backlogs
+
+# Helper to load and summarize Productivity Extract
+def load_productivity_extract():
+    try:
+        prod_df = pd.read_excel(prod_extract_path, header=None)
+
+        # Columns: D (QueueName), E (Accepted), F (Processed), W (QC Pass), X (QC Error)
+        prod_df = prod_df.iloc[:, [3, 4, 5, 22, 23]]
+        prod_df.columns = [
+            "QueueName",
+            "Accepted Volumes",
+            "Processed Volumes",
+            "QC Pass",
+            "QC Error",
+        ]
+
+        # --- Clean queue names ---
+        prod_df["QueueName"] = (
+            prod_df["QueueName"].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
+        )
+
+        # --- Clean numeric fields ---
+        for col in ["Accepted Volumes", "Processed Volumes", "QC Pass", "QC Error"]:
+            prod_df[col] = (
+                prod_df[col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("%", "", regex=False)
+                .str.strip()
+            )
+            prod_df[col] = pd.to_numeric(prod_df[col], errors="coerce").fillna(0)
+
+        # --- Combine QC Pass + QC Error ---
+        prod_df["QC'ed Volumes"] = prod_df["QC Pass"] + prod_df["QC Error"]
+
+        # --- Aggregate totals per Queue ---
+        summary = (
+            prod_df.groupby("QueueName", as_index=False)[
+                ["Accepted Volumes", "Processed Volumes", "QC'ed Volumes"]
+            ]
+            .sum()
+        )
+
+        return summary
+
+    except Exception as e:
+        print("Warning: Could not load Productivity Extract file:", e)
+        return pd.DataFrame(
+            columns=["QueueName", "Accepted Volumes", "Processed Volumes", "QC'ed Volumes"]
+        )
 
 # --- Processing function for layout sheets (GDC & HNW) ---
 def process_layout_sheet(sheet_name, category_headers):
@@ -109,6 +270,29 @@ def process_layout_sheet(sheet_name, category_headers):
     processed_counts = data_dump_df.groupby("Queue")["Document ID"].nunique().to_dict()
     output_df["Processed Volumes"] = output_df["QueueName"].map(processed_counts).fillna(0).astype(int)
 
+    # Overwrite Processed and Accepted Volumes from Productivity Extract if available
+    prod_summary = load_productivity_extract()
+    if not prod_summary.empty:
+        merged = pd.merge(output_df, prod_summary, on="QueueName", how="left", suffixes=("", "_prod"))
+        if "Accepted Volumes_prod" in merged.columns:
+            merged["Accepted Volumes"] = pd.to_numeric(
+                merged["Accepted Volumes_prod"], errors="coerce"
+            ).fillna(pd.to_numeric(merged["Accepted Volumes"], errors="coerce")).fillna(0).astype(int)
+
+        if "Processed Volumes_prod" in merged.columns:
+            merged["Processed Volumes"] = pd.to_numeric(
+                merged["Processed Volumes_prod"], errors="coerce"
+            ).fillna(pd.to_numeric(merged["Processed Volumes"], errors="coerce")).fillna(0).astype(int)
+
+        if "QC'ed Volumes_prod" in merged.columns:
+            merged["QC'ed Volumes"] = pd.to_numeric(
+                merged["QC'ed Volumes_prod"], errors="coerce"
+            ).fillna(pd.to_numeric(merged.get("QC'ed Volumes", 0), errors="coerce")).fillna(0).astype(int)
+
+
+        merged = merged.drop(columns=[c for c in merged.columns if c.endswith("_prod")], errors="ignore")
+        output_df = merged
+
     # --- Reso Queue Mapping (only for GDC) ---
     if sheet_name == "CC Full View of GDC+GTA screen1":
         reso_counts = reso_df.groupby("Doc Type")["Doc ID"].nunique().reset_index(name="ResoCount")
@@ -117,18 +301,16 @@ def process_layout_sheet(sheet_name, category_headers):
         reso_final_counts = reso_with_desc.groupby("Queue_Desc")["ResoCount"].sum().to_dict()
         output_df["Reso Queue"] = output_df["QueueName"].map(reso_final_counts).fillna(0).astype(int)
 
-    # PRO Personal Folders
+    # ✅ PRO Personal Folders
     pro_pf_counts = map_personal_folder_counts(pro_pf_df, reso_map_df)
     if "PRO Personal Folders" in output_df.columns:
         output_df["PRO Personal Folders"] = output_df["QueueName"].map(pro_pf_counts).fillna(0).astype(int)
 
-    # RESO Personal Folders
+    # ✅ RESO Personal Folders
     reso_pf_counts = map_personal_folder_counts(reso_pf_df, reso_map_df)
     if "RESO Personal Folders" in output_df.columns:
         output_df["RESO Personal Folders"] = output_df["QueueName"].map(reso_pf_counts).fillna(0).astype(int)
 
-    output_df["Accepted Volumes"] = 0
-    output_df["QC'ed Volumes"] = 0
     output_df["Resolutions Completed Volumes"] = 0
     output_df["SLA % Completed"] = 0
 
@@ -147,7 +329,7 @@ def process_layout_sheet(sheet_name, category_headers):
     numeric_metrics = [c for c in [
         "PRO Queue", "QC Queue", "User Locked PRO", "User Locked QC",
         "Processed Volumes", "Reso Queue",
-        "PRO Personal Folders", "RESO Personal Folders",  # added into numeric metrics
+        "PRO Personal Folders", "RESO Personal Folders",  # ✅ added into numeric metrics
         "Accepted Volumes", "QC'ed Volumes", "Resolutions Completed Volumes"
     ] if c in output_df.columns]
 
@@ -354,6 +536,40 @@ def process_calendar_events():
 
     return cal_df
 
+def process_announcements():
+    ann_df = pd.read_excel(calendar_path, sheet_name="Announcements")
+
+    # Clean column names
+    ann_df.columns = [str(c).strip() for c in ann_df.columns]
+
+    # Create standardized datetime strings
+    ann_df["Start Date"] = pd.to_datetime(
+        ann_df["Start Day (YYYY-MM-DD)"].astype(str).str.strip() + " " +
+        ann_df["Start Time (HH:MM)"].astype(str).str.strip(),
+        errors="coerce"
+    ).dt.strftime("%Y-%m-%dT%H:%M")
+
+    ann_df["End Date"] = pd.to_datetime(
+        ann_df["End Day (YYYY-MM-DD)"].astype(str).str.strip() + " " +
+        ann_df["End Time (HH:MM)"].astype(str).str.strip(),
+        errors="coerce"
+    ).dt.strftime("%Y-%m-%dT%H:%M")
+
+    # Keep the key columns
+    ann_df = ann_df[[
+        "Title",
+        "Message",
+        "Description",
+        "Severity (Warning, Info, Success)",
+        "Start Date",
+        "End Date"
+    ]]
+
+    # Clean missing or invalid data
+    ann_df = ann_df.fillna("")
+
+    return ann_df
+
 df_gdc = process_layout_sheet(
     sheet_name="CC Full View of GDC+GTA screen1",
     category_headers={"FINANCIAL - Total", "QUASI NON-FINANCIAL - Total", "NON-FINANCIAL - Total"}
@@ -371,6 +587,47 @@ df_exec = process_executive_view(df_gdc, df_hnw)
 df_users = process_users_productivity()
 
 df_calendar = process_calendar_events()
+df_announcements = process_announcements()
+
+# --- Backlogs ---
+df_backlogs = compute_backlogs(data_dump_df, layout_path)
+
+# Match the format of the Dashboard layout
+# Load template layout columns from the "Backlogs" sheet if available
+try:
+    layout_wb = pd.ExcelFile(layout_path)
+    layout_backlog_df = pd.read_excel(layout_wb, sheet_name="Backlogs", header=None)
+
+    header_row_idx = layout_backlog_df[layout_backlog_df.apply(
+        lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(),
+        axis=1
+    )].index[0]
+
+    layout_backlog_columns = layout_backlog_df.iloc[header_row_idx].tolist()
+    layout_backlog_columns = [str(c).strip().replace("\xa0", " ") for c in layout_backlog_columns]
+
+    formatted_backlogs = layout_backlog_df.iloc[header_row_idx+1:].reset_index(drop=True)
+    formatted_backlogs.columns = layout_backlog_columns
+
+    if "QueueName" not in formatted_backlogs.columns:
+        formatted_backlogs.insert(0, "QueueName", layout_backlog_df.iloc[header_row_idx+1:, 0].reset_index(drop=True))
+
+    formatted_backlogs["QueueName"] = formatted_backlogs["QueueName"].astype(str).str.strip()
+
+    # Map actual backlog values
+    formatted_backlogs["PRO Backlogs"] = formatted_backlogs["QueueName"].map(
+        df_backlogs.set_index("QueueName")["PRO Backlogs"]
+    ).fillna(0).astype(int)
+
+    formatted_backlogs["QC Backlogs"] = formatted_backlogs["QueueName"].map(
+        df_backlogs.set_index("QueueName")["QC Backlogs"]
+    ).fillna(0).astype(int)
+
+    df_backlogs_final = formatted_backlogs
+except Exception as e:
+    print("Warning: Could not format Backlogs sheet:", e)
+    df_backlogs_final = df_backlogs
+
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 output_path = rf"C:\Users\edmichaeljoil.fajard\Documents\CBPS - Command Centre Dashboard\Processed_Dashboard_Output.xlsx"
@@ -380,7 +637,9 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     df_hnw.to_excel(writer, index=False, sheet_name="CC Full View of HNW Qs1bis")
     df_users.to_excel(writer, index=False, sheet_name="USERS_Productivity screen2")
     df_exec.to_excel(writer, index=False, sheet_name="Executive View")
+    df_backlogs_final.to_excel(writer, index=False, sheet_name="Backlogs")
     df_calendar.to_excel(writer, index=False, sheet_name="Calendar of Events")
+    df_announcements.to_excel(writer, index=False, sheet_name="Announcements")
     
 print(f"Processed dashboard saved to {output_path}")
 
@@ -423,7 +682,9 @@ df_dict = {
     "hnw": sanitize_columns(df_hnw),
     "users_productivity": sanitize_columns(df_users),
     "executive_view": sanitize_columns(df_exec),
-    "calendar_of_events": sanitize_columns(df_calendar)
+    "calendar_of_events": sanitize_columns(df_calendar),
+    "backlogs": sanitized_columns(df_backlogs_final),
+    "announcements": sanitized_columns(df_announcements)
 }
 
 # --- Function to save to both databases ---
@@ -447,11 +708,5 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
-
-
-
-
-
-
 
 
