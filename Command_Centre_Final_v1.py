@@ -16,6 +16,10 @@ boa_path       = os.path.join(UPLOAD_DIR, "BOA - Time Off Work.xlsm")
 pro_pf_path  = os.path.join(UPLOAD_DIR, "Personal Folder.xlsx")
 reso_pf_path = os.path.join(UPLOAD_DIR, "ECISS Resolutions Personal Folder.xlsx")
 
+fte_target_path = os.path.join(UPLOAD_DIR, "CIF BOA Official Scorecard.xlsx")
+attendance_path = os.path.join(UPLOAD_DIR, "Attendance.xlsx")
+workqueue_mapping_path = os.path.join(UPLOAD_DIR, "Work Queue Team Mapping.xlsx")
+
 calendar_path = os.path.join(UPLOAD_DIR, "Calendar of Events.xlsx")
 
 prod_extract_path = os.path.join(UPLOAD_DIR, "Productivity Extract.csv")
@@ -253,6 +257,101 @@ def load_productivity_extract():
             columns=["QueueName", "Accepted Volumes", "Processed Volumes", "QC'ed Volumes"]
         )
 
+def load_fte_target_times():
+    try:
+        target_df = pd.read_excel(fte_target_path, sheet_name="Target Ave Time", header=None)
+        queue_col = target_df.iloc[:, 0]
+        avg_time_col = target_df.iloc[:, 5]
+
+        df = pd.DataFrame({"QueueName": queue_col, "AvgTime": avg_time_col}).dropna(subset=["QueueName", "AvgTime"])
+
+        # Normalize queue names: uppercase, remove extra spaces, unify case
+        df["QueueName"] = (
+            df["QueueName"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            .str.replace(r"\s+", "", regex=True)  # remove all spaces
+        )
+
+        df["AvgTime"] = pd.to_numeric(df["AvgTime"], errors="coerce").fillna(0)
+        return dict(zip(df["QueueName"], df["AvgTime"]))
+
+    except Exception as e:
+        print("Warning: Could not load FTE target times:", e)
+        return {}
+
+def process_capacity_table(df_gdc):
+    """
+    Build Capacity table using Attendance and Work Queue Team Mapping.
+    Columns: Team, Projected, Required, Actuals
+    """
+    try:
+        # --- Load Attendance ---
+        attendance_df = pd.read_excel(attendance_path)
+        attendance_df.columns = [c.strip() for c in attendance_df.columns]
+        attendance_df["Attendance (Y/N)"] = attendance_df["Attendance (Y/N)"].astype(str).str.upper().str.strip()
+
+        # Count only 'Y' entries
+        attendance_df = attendance_df[attendance_df["Attendance (Y/N)"].str.startswith("Y")]
+        actuals = (
+            attendance_df.groupby("Department")["Processors"]
+            .nunique()
+            .reset_index()
+            .rename(columns={"Department": "Team", "Processors": "Actuals"})
+        )
+
+        # --- Load Work Queue Team Mapping (no headers in sheet) ---
+        team_map_df = pd.read_excel(workqueue_mapping_path, header=None, usecols=[0, 1])
+        team_map_df.columns = ["QueueName", "Team"]
+
+        # Drop blanks and accidental headers
+        team_map_df = team_map_df.dropna(subset=["QueueName", "Team"])
+
+        # Clean and normalize text
+        team_map_df["QueueName"] = team_map_df["QueueName"].astype(str).str.strip()
+        team_map_df["Team"] = team_map_df["Team"].astype(str).str.strip()
+
+        # Remove header-like rows (e.g., 'QueueName' or 'Team')
+        team_map_df = team_map_df[
+            ~team_map_df["QueueName"].str.upper().isin(["QUEUENAME", "QUEUE", "TEAM"])
+        ]
+        team_map_df = team_map_df[
+            ~team_map_df["Team"].str.upper().isin(["TEAM", "DEPARTMENT", "GROUP"])
+        ]
+
+        team_map_df["QueueKey"] = (
+            team_map_df["QueueName"].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
+        )
+
+
+        # --- Compute Required (sum of FTE per queue → grouped by team) ---
+        fte_target_map = load_fte_target_times()
+
+        df_gdc = df_gdc.reset_index()
+        df_gdc["QueueKey"] = df_gdc["QueueName"].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
+        df_gdc["PRO Queue"] = pd.to_numeric(df_gdc["PRO Queue"], errors="coerce").fillna(0)
+
+        def compute_fte(row):
+            avg_time = fte_target_map.get(row["QueueKey"], 0)
+            return (row["PRO Queue"] * avg_time) / 420 if avg_time > 0 else 0
+
+        df_gdc["QueueFTE"] = df_gdc.apply(compute_fte, axis=1)
+
+        merged = pd.merge(df_gdc, team_map_df, on="QueueKey", how="left")
+        required = merged.groupby("Team")["QueueFTE"].sum().reset_index().rename(columns={"QueueFTE": "Required"})
+
+        # --- Combine both ---
+        capacity_df = pd.merge(required, actuals, on="Team", how="outer").fillna(0)
+        capacity_df["Projected"] = 0
+        capacity_df = capacity_df[["Team", "Projected", "Required", "Actuals"]]
+
+        return capacity_df
+
+    except Exception as e:
+        print("Warning: Could not build Capacity table:", e)
+        return pd.DataFrame(columns=["Team", "Projected", "Required", "Actuals"])
+
 # --- Processing function for layout sheets (GDC & HNW) ---
 def process_layout_sheet(sheet_name, category_headers):
     layout_wb = pd.ExcelFile(layout_path)
@@ -425,7 +524,21 @@ def process_layout_sheet(sheet_name, category_headers):
             + safe_numeric(output_df.get("RESO Personal Folders", 0), output_df)
             + safe_numeric(output_df.get("RESO FTE Locked", 0), output_df)
         )
+        
+    # --- Compute FTE Required based on Target Ave Time ---
+    fte_target_map = load_fte_target_times()
 
+    def compute_fte_required(row):
+        # normalize to same format used above
+        queue = str(row["QueueName"]).upper().replace(" ", "").strip()
+        pro_count = row.get("PRO Queue", 0)
+        avg_time = fte_target_map.get(queue, 0)
+        if avg_time > 0 and pro_count > 0:
+            return round((pro_count * avg_time) / 420, 2)
+        return 0
+
+    output_df["FTE Required"] = output_df.apply(compute_fte_required, axis=1)
+    
     time_now = datetime.now().strftime("%I:%M %p")
     output_df = output_df.rename(
         columns={col: f"Bulletin Board (Generated at {time_now})"
@@ -624,8 +737,15 @@ df_users = process_users_productivity()
 df_calendar = process_calendar_events()
 df_announcements = process_announcements()
 
+# --- Capacity Table ---
+df_capacity = process_capacity_table(df_gdc)
+
 # --- Backlogs ---
 df_backlogs = compute_backlogs(data_dump_df, layout_path)
+
+# Standardize column name for consistency
+if "QueueName" not in df_backlogs.columns and "CI GTA & GDC Queue Volumes" in df_backlogs.columns:
+    df_backlogs = df_backlogs.rename(columns={"CI GTA & GDC Queue Volumes": "QueueName"})
 
 # Match the format of the Dashboard layout
 # Load template layout columns from the "Backlogs" sheet if available
@@ -719,6 +839,7 @@ df_dict = {
     "executive_view": sanitize_columns(df_exec),
     "calendar_of_events": sanitize_columns(df_calendar),
     "backlogs": sanitize_columns(df_backlogs_final),
+    "capacity": sanitize_columns(df_capacity),
     "announcements": sanitize_columns(df_announcements)
 }
 
@@ -743,6 +864,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
