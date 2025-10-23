@@ -19,6 +19,7 @@ reso_pf_path = os.path.join(UPLOAD_DIR, "ECISS Resolutions Personal Folder.xlsx"
 fte_target_path = os.path.join(UPLOAD_DIR, "CIF BOA Official Scorecard.xlsx")
 attendance_path = os.path.join(UPLOAD_DIR, "Attendance.xlsx")
 workqueue_mapping_path = os.path.join(UPLOAD_DIR, "Work Queue Team Mapping.xlsx")
+reso_completed_path = os.path.join(UPLOAD_DIR, "Resolution Completed Volumes.xlsx")
 
 calendar_path = os.path.join(UPLOAD_DIR, "Calendar of Events.xlsx")
 
@@ -97,6 +98,54 @@ def map_personal_folder_counts_reso(folder_df, reso_map_df):
     )
 
     return mapped.groupby("Queue_Desc")["PFCount"].sum().to_dict()
+
+def map_resolutions_completed(reso_completed_path):
+    """
+    Load Resolutions Completed Volumes file and count unique Document IDs per Doc Type.
+    Returns a dict: {Doc Type: unique count of Document ID}
+    """
+    try:
+        df = pd.read_excel(reso_completed_path, usecols=[1, 2])  # Columns B and C
+        df.columns = ["Document ID", "Doc Type"]
+        df["Document ID"] = df["Document ID"].astype(str).str.strip()
+        df["Doc Type"] = df["Doc Type"].astype(str).str.strip()
+
+        # Count unique Document IDs per Doc Type
+        counts = (
+            df.groupby("Doc Type")["Document ID"]
+            .nunique()
+            .reset_index(name="ResolutionsCompletedCount")
+        )
+
+        return counts.set_index("Doc Type")["ResolutionsCompletedCount"].to_dict()
+
+    except Exception as e:
+        print("Warning: Could not load Resolutions Completed Volumes file:", e)
+        return {}
+    
+def map_queue_aging(data_dump_df):
+    """
+    Compute maximum Aging (in minutes) per Queue based on Entry Date.
+    Returns dict: {QueueName: max_aging_minutes}
+    """
+    try:
+        df = data_dump_df.copy()
+        df["Queue"] = df["Queue"].astype(str).str.strip()
+        df["Entry Date"] = pd.to_datetime(df["Entry Date"], errors="coerce")
+
+        now = pd.Timestamp.now()
+
+        # Compute age in minutes for each document
+        df["AgingMinutes"] = (now - df["Entry Date"]).dt.total_seconds() / 60
+
+        # Get max aging per queue
+        aging_map = df.groupby("Queue")["AgingMinutes"].max().fillna(0).to_dict()
+
+        return aging_map
+
+    except Exception as e:
+        print("Warning: Could not compute Aging values:", e)
+        return {}
 
 # Helper to compute PRO and QC Backlogs (with totals by category)
 def compute_backlogs(data_dump_df, layout_path):
@@ -334,7 +383,9 @@ def process_capacity_table(df_gdc):
 
         def compute_fte(row):
             avg_time = fte_target_map.get(row["QueueKey"], 0)
-            return (row["PRO Queue"] * avg_time) / 420 if avg_time > 0 else 0
+            if avg_time > 0 and row["PRO Queue"] > 0:
+                return round((row["PRO Queue"] * avg_time) / 420, 3)
+            return 0
 
         df_gdc["QueueFTE"] = df_gdc.apply(compute_fte, axis=1)
 
@@ -378,7 +429,6 @@ def process_layout_sheet(sheet_name, category_headers):
         .str.replace(r"\s+", " ", regex=True)
     )
 
-    # --- PRO QUEUES ---
     pro_entries = data_dump_df[~data_dump_df["Queue"].astype(str).str.endswith("QC", na=False)].copy()
     pro_counts = pro_entries.groupby("Queue")["Document ID"].nunique().to_dict()
     pro_locked_counts = pro_entries[pro_entries["Lock Status"] == "LOCKED"].groupby("Queue")["Document ID"].nunique().to_dict()
@@ -386,7 +436,7 @@ def process_layout_sheet(sheet_name, category_headers):
     output_df["PRO Queue"] = output_df["QueueName"].map(pro_counts).fillna(0).astype(int)
     output_df["User Locked PRO"] = output_df["QueueName"].map(pro_locked_counts).fillna(0).astype(int)
 
-    # --- QC QUEUES ---
+
     qc_entries = data_dump_df[data_dump_df["Queue"].astype(str).str.endswith("QC", na=False)].copy()
     qc_entries["BaseQueue"] = qc_entries["Queue"].astype(str).str.replace(r"QC$", "", regex=True).str.strip()
 
@@ -396,11 +446,11 @@ def process_layout_sheet(sheet_name, category_headers):
     output_df["QC Queue"] = output_df["QueueName"].map(qc_counts).fillna(0).astype(int)
     output_df["User Locked QC"] = output_df["QueueName"].map(qc_locked_counts).fillna(0).astype(int)
 
-    # --- Processed Volumes ---
+
     processed_counts = data_dump_df.groupby("Queue")["Document ID"].nunique().to_dict()
     output_df["Processed Volumes"] = output_df["QueueName"].map(processed_counts).fillna(0).astype(int)
 
-    # Overwrite Processed and Accepted Volumes from Productivity Extract if available
+
     prod_summary = load_productivity_extract()
     if not prod_summary.empty:
         merged = pd.merge(output_df, prod_summary, on="QueueName", how="left", suffixes=("", "_prod"))
@@ -423,7 +473,7 @@ def process_layout_sheet(sheet_name, category_headers):
         merged = merged.drop(columns=[c for c in merged.columns if c.endswith("_prod")], errors="ignore")
         output_df = merged
 
-    # --- Reso Queue Mapping (only for GDC) ---
+
     if sheet_name == "CC Full View of GDC+GTA screen1":
         reso_counts = reso_df.groupby("Doc Type")["Doc ID"].nunique().reset_index(name="ResoCount")
         reso_with_desc = pd.merge(reso_counts, reso_map_df[["Doc_Type", "Queue_Desc"]],
@@ -431,24 +481,44 @@ def process_layout_sheet(sheet_name, category_headers):
         reso_final_counts = reso_with_desc.groupby("Queue_Desc")["ResoCount"].sum().to_dict()
         output_df["Reso Queue"] = output_df["QueueName"].map(reso_final_counts).fillna(0).astype(int)
 
-    # PRO Personal Folders (direct queue-based)
+
     pro_pf_counts = map_personal_folder_counts_pro(pro_pf_df)
     if "PRO Personal Folders" in output_df.columns:
         output_df["PRO Personal Folders"] = (
             output_df["QueueName"].map(pro_pf_counts).fillna(0).astype(int)
         )
 
-    # RESO Personal Folders (Doc Type → Queue mapping)
+
     reso_pf_counts = map_personal_folder_counts_reso(reso_pf_df, reso_map_df)
     if "RESO Personal Folders" in output_df.columns:
         output_df["RESO Personal Folders"] = (
             output_df["QueueName"].map(reso_pf_counts).fillna(0).astype(int)
         )
 
-    output_df["Resolutions Completed Volumes"] = 0
-    output_df["SLA % Completed"] = 0
+    # Compute Aging per queue (max minutes since Entry Date)
+    aging_map = map_queue_aging(data_dump_df)
 
-    # --- Build Queue → Category mapping ---
+    output_df["Aging"] = (
+        output_df["QueueName"]
+        .astype(str)
+        .str.strip()
+        .map(aging_map)
+        .fillna(0)
+        .round(0)
+        .astype(int)
+    )
+
+    reso_completed_map = map_resolutions_completed(reso_completed_path)
+
+    # Normalize Queue names to uppercase (same key style as reso_completed_map)
+    output_df["Resolutions Completed Volumes"] = (
+        output_df["QueueName"]
+        .astype(str)
+        .str.strip()
+        .map(lambda q: reso_completed_map.get(q, 0))
+    )
+
+
     queue_to_category = {}
     current_cat = None
     for q in output_df["QueueName"]:
@@ -463,15 +533,60 @@ def process_layout_sheet(sheet_name, category_headers):
     numeric_metrics = [c for c in [
         "PRO Queue", "QC Queue", "User Locked PRO", "User Locked QC",
         "Processed Volumes", "Reso Queue",
-        "PRO Personal Folders", "RESO Personal Folders",  # ✅ added into numeric metrics
-        "Accepted Volumes", "QC'ed Volumes", "Resolutions Completed Volumes"
+        "PRO Personal Folders", "RESO Personal Folders",
+        "Accepted Volumes", "QC'ed Volumes", "Resolutions Completed Volumes", "Aging"
     ] if c in output_df.columns]
 
-    for cat in category_headers:
-        child_rows = output_df[output_df["Category"] == cat]
-        totals = child_rows[numeric_metrics].sum(numeric_only=True)
-        for col in numeric_metrics:
-            output_df.loc[output_df["QueueName"] == cat, col] = totals.get(col, 0)
+    fte_target_map = load_fte_target_times()
+
+    def compute_fte_required(row):
+        queue = str(row["QueueName"]).upper().replace(" ", "").strip()
+        pro_count = row.get("PRO Queue", 0)
+        avg_time = fte_target_map.get(queue, 0)
+        if avg_time > 0 and pro_count > 0:
+            # exact computation without rounding
+            fte = (pro_count * avg_time) / 420
+            return round(fte, 2)  # keep two decimals for precision
+        return 0
+
+
+    output_df["FTE Required"] = output_df.apply(compute_fte_required, axis=1)
+
+    # --- Roll up totals safely per category (using position-based slicing)
+    queue_list = list(output_df["QueueName"])
+
+    for i, q in enumerate(queue_list):
+        if q in category_headers:
+            # find where the next category header or 'Grand Total' starts
+            next_index = None
+            for j in range(i + 1, len(queue_list)):
+                if queue_list[j] in category_headers or queue_list[j] == "Other - Total" or queue_list[j] == "Grand Total by Queue:":
+                    next_index = j
+                    break
+
+            # define slice (rows between this header and the next header)
+            if next_index:
+                child_rows = output_df.iloc[i + 1:next_index]
+            else:
+                child_rows = output_df.iloc[i + 1:]
+
+            # Compute sums for all numeric metrics except Aging
+            totals = child_rows[[c for c in numeric_metrics if c != "Aging"]].sum(numeric_only=True)
+
+            # Assign Aging separately as the max value among children
+            aging_max = child_rows["Aging"].max() if "Aging" in child_rows.columns else 0
+
+            # Write the totals back to the parent row
+            for col in numeric_metrics:
+                if col == "Aging":
+                    output_df.loc[output_df["QueueName"] == q, "Aging"] = aging_max
+                else:
+                    output_df.loc[output_df["QueueName"] == q, col] = totals.get(col, 0)
+
+            # roll up FTE Required safely
+            if "FTE Required" in output_df.columns:
+                output_df.loc[output_df["QueueName"] == q, "FTE Required"] = child_rows["FTE Required"].sum()
+
 
     special_map = {
         "Doc Translation": "DocTranslation",
@@ -510,6 +625,12 @@ def process_layout_sheet(sheet_name, category_headers):
     for col in numeric_metrics:
         output_df.loc[output_df["QueueName"] == "Grand Total by Queue:", col] = grand_totals.get(col, 0)
 
+    # Include FTE Required in Grand Total
+    if "FTE Required" in output_df.columns:
+        output_df.loc[output_df["QueueName"] == "Grand Total by Queue:", "FTE Required"] = \
+            output_df.loc[output_df["QueueName"].isin(category_headers), "FTE Required"].sum()
+
+
     if "Total" in output_df.columns:
         output_df["Total"] = (
             safe_numeric(output_df.get("PRO Queue", 0), output_df)
@@ -524,21 +645,8 @@ def process_layout_sheet(sheet_name, category_headers):
             + safe_numeric(output_df.get("RESO Personal Folders", 0), output_df)
             + safe_numeric(output_df.get("RESO FTE Locked", 0), output_df)
         )
-        
-    # --- Compute FTE Required based on Target Ave Time ---
-    fte_target_map = load_fte_target_times()
 
-    def compute_fte_required(row):
-        # normalize to same format used above
-        queue = str(row["QueueName"]).upper().replace(" ", "").strip()
-        pro_count = row.get("PRO Queue", 0)
-        avg_time = fte_target_map.get(queue, 0)
-        if avg_time > 0 and pro_count > 0:
-            return round((pro_count * avg_time) / 420, 2)
-        return 0
 
-    output_df["FTE Required"] = output_df.apply(compute_fte_required, axis=1)
-    
     time_now = datetime.now().strftime("%I:%M %p")
     output_df = output_df.rename(
         columns={col: f"Bulletin Board (Generated at {time_now})"
@@ -787,6 +895,11 @@ except Exception as e:
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 output_path = rf"C:\Users\edmichaeljoil.fajard\Documents\CBPS - Command Centre Dashboard\Processed_Dashboard_Output.xlsx"
 
+# Add unique ID columns to GDC, HNW, and Backlogs
+df_gdc.insert(0, "Row_ID", range(1, len(df_gdc) + 1))
+df_hnw.insert(0, "Row_ID", range(1, len(df_hnw) + 1))
+df_backlogs_final.insert(0, "Row_ID", range(1, len(df_backlogs_final) + 1))
+
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     df_gdc.to_excel(writer, index=False, sheet_name="CC Full View of GDC+GTA screen1")
     df_hnw.to_excel(writer, index=False, sheet_name="CC Full View of HNW Qs1bis")
@@ -864,7 +977,6 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
-
 
 
 
