@@ -995,7 +995,7 @@ df_dict = {
     "backlogs": sanitize_columns(df_backlogs_final),
     "capacity": sanitize_columns(df_capacity),
     "announcements": sanitize_columns(df_announcements),
-    "last_updated": sanitized_columns(df_last_updated)
+    "last_updated": sanitize_columns(df_last_updated)
 }
 
 # --- Function to save to both databases ---
@@ -1019,6 +1019,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
