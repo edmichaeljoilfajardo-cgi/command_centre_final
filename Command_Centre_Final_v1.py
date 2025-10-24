@@ -125,8 +125,8 @@ def map_resolutions_completed(reso_completed_path):
     
 def map_queue_aging(data_dump_df):
     """
-    Compute maximum Aging (in minutes) per Queue based on Entry Date.
-    Returns dict: {QueueName: max_aging_minutes}
+    Compute count of documents per Queue that are older than 60 minutes.
+    Returns dict: {QueueName: count_over_60mins}
     """
     try:
         df = data_dump_df.copy()
@@ -138,10 +138,17 @@ def map_queue_aging(data_dump_df):
         # Compute age in minutes for each document
         df["AgingMinutes"] = (now - df["Entry Date"]).dt.total_seconds() / 60
 
-        # Get max aging per queue
-        aging_map = df.groupby("Queue")["AgingMinutes"].max().fillna(0).to_dict()
+        # Count how many documents per queue exceed 60 minutes
+        aging_count_map = (
+            df[df["AgingMinutes"] > 60]
+            .groupby("Queue")["Document ID"]
+            .nunique()
+            .fillna(0)
+            .astype(int)
+            .to_dict()
+        )
 
-        return aging_map
+        return aging_count_map
 
     except Exception as e:
         print("Warning: Could not compute Aging values:", e)
@@ -149,6 +156,10 @@ def map_queue_aging(data_dump_df):
 
 # Helper to compute PRO and QC Backlogs (with totals by category)
 def compute_backlogs(data_dump_df, layout_path):
+    """
+    Compute PRO and QC Backlogs with accurate category and grand totals.
+    Totals are based on actual layout order (position-based slicing), not just category mapping.
+    """
     # --- Step 1. Compute base backlog counts ---
     df = data_dump_df.copy()
     df["Entry Date"] = pd.to_datetime(df["Entry Date"], errors="coerce")
@@ -177,14 +188,14 @@ def compute_backlogs(data_dump_df, layout_path):
     backlog_summary["PRO Backlogs"] = backlog_summary["PRO Backlogs"].astype(int)
     backlog_summary["QC Backlogs"] = backlog_summary["QC Backlogs"].astype(int)
 
-    # --- Step 2. Load the layout template for ordering ---
+    # --- Step 2. Load layout template (Backlogs sheet) ---
     layout_wb = pd.ExcelFile(layout_path)
     layout_df = pd.read_excel(layout_wb, sheet_name="Backlogs", header=None)
 
-    header_row_idx = layout_df[layout_df.apply(
-        lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(),
-        axis=1
-    )].index[0]
+    # Find header row dynamically
+    header_row_idx = layout_df[
+        layout_df.apply(lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(), axis=1)
+    ].index[0]
 
     layout_columns = layout_df.iloc[header_row_idx].tolist()
     layout_columns = [str(c).strip().replace("\xa0", " ") for c in layout_columns]
@@ -192,21 +203,30 @@ def compute_backlogs(data_dump_df, layout_path):
     formatted_backlogs = layout_df.iloc[header_row_idx + 1:].reset_index(drop=True)
     formatted_backlogs.columns = layout_columns
 
+    # Ensure QueueName column exists
     if "QueueName" not in formatted_backlogs.columns:
-        formatted_backlogs.insert(0, "QueueName", layout_df.iloc[header_row_idx + 1:, 0].reset_index(drop=True))
+        formatted_backlogs.insert(
+            0, "QueueName", layout_df.iloc[header_row_idx + 1:, 0].reset_index(drop=True)
+        )
 
     formatted_backlogs["QueueName"] = formatted_backlogs["QueueName"].astype(str).str.strip()
 
-    # --- Step 3. Map actual backlog values ---
-    formatted_backlogs["PRO Backlogs"] = formatted_backlogs["QueueName"].map(
-        backlog_summary.set_index("QueueName")["PRO Backlogs"]
-    ).fillna(0).astype(int)
+    # --- Step 3. Map backlog counts from data dump ---
+    formatted_backlogs["PRO Backlogs"] = (
+        formatted_backlogs["QueueName"]
+        .map(backlog_summary.set_index("QueueName")["PRO Backlogs"])
+        .fillna(0)
+        .astype(int)
+    )
 
-    formatted_backlogs["QC Backlogs"] = formatted_backlogs["QueueName"].map(
-        backlog_summary.set_index("QueueName")["QC Backlogs"]
-    ).fillna(0).astype(int)
+    formatted_backlogs["QC Backlogs"] = (
+        formatted_backlogs["QueueName"]
+        .map(backlog_summary.set_index("QueueName")["QC Backlogs"])
+        .fillna(0)
+        .astype(int)
+    )
 
-    # --- Step 4. Define category totals ---
+    # --- Step 4. Define category headers ---
     category_headers = [
         "FINANCIAL - Total",
         "QUASI NON-FINANCIAL - Total",
@@ -214,45 +234,56 @@ def compute_backlogs(data_dump_df, layout_path):
         "Other - Total",
     ]
 
-    queue_to_category = {}
-    current_cat = None
-    for q in formatted_backlogs["QueueName"]:
+    # --- Step 5. Roll up totals safely per category (positional slicing logic) ---
+    queue_list = list(formatted_backlogs["QueueName"])
+
+    for i, q in enumerate(queue_list):
         if q in category_headers:
-            current_cat = q
-        elif q == "Grand Total by Queue:":
-            continue
-        elif current_cat is not None:
-            queue_to_category[q] = current_cat
+            # find where the next category header or grand total starts
+            next_index = None
+            for j in range(i + 1, len(queue_list)):
+                if (
+                    queue_list[j] in category_headers
+                    or queue_list[j] == "Other - Total"
+                    or queue_list[j] == "Grand Total by Queue:"
+                ):
+                    next_index = j
+                    break
 
-    formatted_backlogs["Category"] = formatted_backlogs["QueueName"].map(queue_to_category)
+            # slice rows between this header and the next header
+            if next_index:
+                child_rows = formatted_backlogs.iloc[i + 1:next_index]
+            else:
+                child_rows = formatted_backlogs.iloc[i + 1:]
 
-    # --- Step 5. Roll up totals per category ---
-    for cat in category_headers:
-        child_rows = formatted_backlogs[formatted_backlogs["Category"] == cat]
-        pro_sum = child_rows["PRO Backlogs"].sum()
-        qc_sum = child_rows["QC Backlogs"].sum()
-        formatted_backlogs.loc[formatted_backlogs["QueueName"] == cat, "PRO Backlogs"] = pro_sum
-        formatted_backlogs.loc[formatted_backlogs["QueueName"] == cat, "QC Backlogs"] = qc_sum
+            # Sum PRO and QC backlogs of child rows
+            pro_sum = child_rows["PRO Backlogs"].sum()
+            qc_sum = child_rows["QC Backlogs"].sum()
 
-    # --- Step 6. Grand total ---
-    grand_sources = set(category_headers) | {"Other - Total"}
-    grand_totals = formatted_backlogs.loc[
-        formatted_backlogs["QueueName"].isin(grand_sources), ["PRO Backlogs", "QC Backlogs"]
-    ].sum()
+            # Write totals to category header
+            formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "PRO Backlogs"] = pro_sum
+            formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "QC Backlogs"] = qc_sum
+
+    # --- Step 6. Compute Grand Total (sum of category totals) ---
+    grand_total_rows = formatted_backlogs[
+        formatted_backlogs["QueueName"].isin(category_headers + ["Other - Total"])
+    ]
+    grand_pro = grand_total_rows["PRO Backlogs"].sum()
+    grand_qc = grand_total_rows["QC Backlogs"].sum()
 
     formatted_backlogs.loc[
-        formatted_backlogs["QueueName"] == "Grand Total by Queue:", ["PRO Backlogs", "QC Backlogs"]
-    ] = grand_totals.values
+        formatted_backlogs["QueueName"].str.strip().str.lower() == "grand total by queue:",
+        ["PRO Backlogs", "QC Backlogs"]
+    ] = [grand_pro, grand_qc]
 
     # --- Step 7. Cleanup ---
-    formatted_backlogs = formatted_backlogs.drop(columns=["Category"], errors="ignore")
     formatted_backlogs = formatted_backlogs.fillna(0)
+    formatted_backlogs = formatted_backlogs.drop(columns=["Category"], errors="ignore")
 
-    # Drop duplicate QueueName column if both exist
+    # Handle duplicate columns if they exist
     if "QueueName" in formatted_backlogs.columns and "CI GTA & GDC Queue Volumes" in formatted_backlogs.columns:
         if formatted_backlogs["QueueName"].equals(formatted_backlogs["CI GTA & GDC Queue Volumes"]):
             formatted_backlogs = formatted_backlogs.drop(columns=["QueueName"])
-
 
     return formatted_backlogs
 
@@ -570,18 +601,12 @@ def process_layout_sheet(sheet_name, category_headers):
             else:
                 child_rows = output_df.iloc[i + 1:]
 
-            # Compute sums for all numeric metrics except Aging
-            totals = child_rows[[c for c in numeric_metrics if c != "Aging"]].sum(numeric_only=True)
+            # Compute sums for all numeric metrics including Aging (since Aging is now a count)
+            totals = child_rows[numeric_metrics].sum(numeric_only=True)
 
-            # Assign Aging separately as the max value among children
-            aging_max = child_rows["Aging"].max() if "Aging" in child_rows.columns else 0
-
-            # Write the totals back to the parent row
+            # Write the totals back to the parent row (including Aging)
             for col in numeric_metrics:
-                if col == "Aging":
-                    output_df.loc[output_df["QueueName"] == q, "Aging"] = aging_max
-                else:
-                    output_df.loc[output_df["QueueName"] == q, col] = totals.get(col, 0)
+                output_df.loc[output_df["QueueName"] == q, col] = totals.get(col, 0)
 
             # roll up FTE Required safely
             if "FTE Required" in output_df.columns:
@@ -891,6 +916,21 @@ except Exception as e:
     print("Warning: Could not format Backlogs sheet:", e)
     df_backlogs_final = df_backlogs
 
+last_updated_records = [
+    ["CC Full View of GDC+GTA screen1", "Digital Dashboard Layout + Requirements.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["CC Full View of HNW Qs1bis", "Digital Dashboard Layout + Requirements.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["Executive View", "Derived from GDC + HNW tables", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["USERS_Productivity screen2", "Digital Dashboard Layout + Requirements.xlsx / BOA - Time Off Work.xlsm", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["Capacity", "Attendance.xlsx / Work Queue Team Mapping.xlsx / CIF BOA Official Scorecard.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["Backlogs", "Digital Dashboard Queue Names Data Dump.xlsx / Digital Dashboard Layout + Requirements.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["Calendar of Events", "Calendar of Events.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["Announcements", "Calendar of Events.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+]
+
+df_last_updated = pd.DataFrame(
+    last_updated_records,
+    columns=["Table Name", "Source File(s)", "Last Updated (Timestamp)"]
+)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 output_path = rf"C:\Users\edmichaeljoil.fajard\Documents\CBPS - Command Centre Dashboard\Processed_Dashboard_Output.xlsx"
@@ -908,6 +948,7 @@ with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     df_backlogs_final.to_excel(writer, index=False, sheet_name="Backlogs")
     df_calendar.to_excel(writer, index=False, sheet_name="Calendar of Events")
     df_announcements.to_excel(writer, index=False, sheet_name="Announcements")
+    df_last_updated.to_excel(writer, index=False, sheet_name="Last Updated")
     
 print(f"Processed dashboard saved to {output_path}")
 
@@ -953,7 +994,8 @@ df_dict = {
     "calendar_of_events": sanitize_columns(df_calendar),
     "backlogs": sanitize_columns(df_backlogs_final),
     "capacity": sanitize_columns(df_capacity),
-    "announcements": sanitize_columns(df_announcements)
+    "announcements": sanitize_columns(df_announcements),
+    "last_updated": sanitized_columns(df_last_updated)
 }
 
 # --- Function to save to both databases ---
@@ -977,6 +1019,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
