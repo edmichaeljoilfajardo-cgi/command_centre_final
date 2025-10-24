@@ -125,8 +125,8 @@ def map_resolutions_completed(reso_completed_path):
     
 def map_queue_aging(data_dump_df):
     """
-    Compute count of documents per Queue that are older than 60 minutes.
-    Returns dict: {QueueName: count_over_60mins}
+    Compute count of documents older than 60 minutes for both PRO and QC queues.
+    Returns two dicts: aging_pro_map and aging_qc_map
     """
     try:
         df = data_dump_df.copy()
@@ -138,36 +138,70 @@ def map_queue_aging(data_dump_df):
         # Compute age in minutes for each document
         df["AgingMinutes"] = (now - df["Entry Date"]).dt.total_seconds() / 60
 
-        # Count how many documents per queue exceed 60 minutes
-        aging_count_map = (
-            df[df["AgingMinutes"] > 60]
-            .groupby("Queue")["Document ID"]
+        # Only consider entries older than 60 minutes
+        aged_df = df[df["AgingMinutes"] > 60].copy()
+
+        # Normalize keys
+        aged_df["QueueKey"] = (
+            aged_df["Queue"]
+            .astype(str)
+            .str.upper()
+            .str.replace(r"\s+", "", regex=True)
+            .str.strip()
+        )
+
+        # Split PRO and QC queues
+        aged_df["Is_QC"] = aged_df["Queue"].str.endswith("QC", na=False)
+        aged_df["BaseQueueKey"] = (
+            aged_df["Queue"]
+            .str.replace(r"QC$", "", regex=True)
+            .str.upper()
+            .str.replace(r"\s+", "", regex=True)
+            .str.strip()
+        )
+
+        # Count aged documents for PRO and QC separately
+        aging_pro_map = (
+            aged_df[~aged_df["Is_QC"]]
+            .groupby("QueueKey")["Document ID"]
             .nunique()
-            .fillna(0)
             .astype(int)
             .to_dict()
         )
 
-        return aging_count_map
+        aging_qc_map = (
+            aged_df[aged_df["Is_QC"]]
+            .groupby("BaseQueueKey")["Document ID"]
+            .nunique()
+            .astype(int)
+            .to_dict()
+        )
+
+        return aging_pro_map, aging_qc_map
 
     except Exception as e:
         print("Warning: Could not compute Aging values:", e)
-        return {}
+        return {}, {}
 
 # Helper to compute PRO and QC Backlogs (with totals by category)
-def compute_backlogs(data_dump_df, layout_path):
+def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Backlogs"):
     """
-    Compute PRO and QC Backlogs with accurate category and grand totals.
-    Totals are based on actual layout order (position-based slicing), not just category mapping.
+    Compute PRO and QC Backlogs with full queue details and accurate category totals.
+    Includes all queues from the layout.
     """
-    # --- Step 1. Compute base backlog counts ---
+
+    # --- Step 1: Compute raw backlog counts ---
     df = data_dump_df.copy()
     df["Entry Date"] = pd.to_datetime(df["Entry Date"], errors="coerce")
+
     today = pd.Timestamp.now().normalize()
-    backlog_df = df[df["Entry Date"] < today]
+    # Count only entries with Entry Date before today
+    backlog_df = df[df["Entry Date"].dt.normalize() < today]
 
-    backlog_df["Is_QC"] = backlog_df["Queue"].astype(str).str.endswith("QC", na=False)
+    backlog_df["Queue"] = backlog_df["Queue"].astype(str).str.strip()
+    backlog_df["Is_QC"] = backlog_df["Queue"].str.endswith("QC", na=False)
 
+    # PRO (non-QC queues)
     pro_backlogs = (
         backlog_df[~backlog_df["Is_QC"]]
         .groupby("Queue")["Document ID"]
@@ -175,24 +209,38 @@ def compute_backlogs(data_dump_df, layout_path):
         .reset_index(name="PRO Backlogs")
     )
 
+    # QC (ending with QC)
     qc_backlogs = (
         backlog_df[backlog_df["Is_QC"]]
-        .groupby("Queue")["Document ID"]
+        .assign(BaseQueue=lambda x: x["Queue"].str.replace(r"QC$", "", regex=True).str.strip())
+        .groupby("BaseQueue")["Document ID"]
         .nunique()
         .reset_index(name="QC Backlogs")
     )
-    qc_backlogs["Queue"] = qc_backlogs["Queue"].str.replace(r"QC$", "", regex=True).str.strip()
 
-    backlog_summary = pd.merge(pro_backlogs, qc_backlogs, on="Queue", how="outer").fillna(0)
-    backlog_summary = backlog_summary.rename(columns={"Queue": "QueueName"})
+    backlog_summary = pd.merge(
+        pro_backlogs.rename(columns={"Queue": "QueueName"}),
+        qc_backlogs.rename(columns={"BaseQueue": "QueueName"}),
+        on="QueueName",
+        how="outer"
+    ).fillna(0)
+
     backlog_summary["PRO Backlogs"] = backlog_summary["PRO Backlogs"].astype(int)
     backlog_summary["QC Backlogs"] = backlog_summary["QC Backlogs"].astype(int)
 
-    # --- Step 2. Load layout template (Backlogs sheet) ---
-    layout_wb = pd.ExcelFile(layout_path)
-    layout_df = pd.read_excel(layout_wb, sheet_name="Backlogs", header=None)
+    # Normalize for consistent key matching
+    backlog_summary["QueueKey"] = (
+        backlog_summary["QueueName"].astype(str)
+        .str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.strip()
+    )
 
-    # Find header row dynamically
+    # --- Step 2: Load layout (Backlogs sheet) ---
+    layout_wb = pd.ExcelFile(layout_path)
+    layout_df = pd.read_excel(layout_wb, sheet_name=layout_sheet, header=None)
+
+
     header_row_idx = layout_df[
         layout_df.apply(lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(), axis=1)
     ].index[0]
@@ -203,87 +251,92 @@ def compute_backlogs(data_dump_df, layout_path):
     formatted_backlogs = layout_df.iloc[header_row_idx + 1:].reset_index(drop=True)
     formatted_backlogs.columns = layout_columns
 
-    # Ensure QueueName column exists
-    if "QueueName" not in formatted_backlogs.columns:
-        formatted_backlogs.insert(
-            0, "QueueName", layout_df.iloc[header_row_idx + 1:, 0].reset_index(drop=True)
-        )
+    # Identify queue column
+    queue_col = None
+    for col in formatted_backlogs.columns:
+        if "queue" in col.lower():
+            queue_col = col
+            break
+    if not queue_col:
+        queue_col = "QueueName"
 
+
+    formatted_backlogs.rename(columns={queue_col: "QueueName"}, inplace=True)
     formatted_backlogs["QueueName"] = formatted_backlogs["QueueName"].astype(str).str.strip()
 
-    # --- Step 3. Map backlog counts from data dump ---
-    formatted_backlogs["PRO Backlogs"] = (
-        formatted_backlogs["QueueName"]
-        .map(backlog_summary.set_index("QueueName")["PRO Backlogs"])
-        .fillna(0)
-        .astype(int)
+    formatted_backlogs["QueueKey"] = (
+        formatted_backlogs["QueueName"].astype(str)
+        .str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.strip()
     )
 
-    formatted_backlogs["QC Backlogs"] = (
-        formatted_backlogs["QueueName"]
-        .map(backlog_summary.set_index("QueueName")["QC Backlogs"])
-        .fillna(0)
-        .astype(int)
+    # --- Step 3: Map backlog counts for each queue ---
+    backlog_summary_unique = (
+        backlog_summary.groupby("QueueKey", as_index=False)[["PRO Backlogs", "QC Backlogs"]].sum()
     )
 
-    # --- Step 4. Define category headers ---
-    category_headers = [
-        "FINANCIAL - Total",
-        "QUASI NON-FINANCIAL - Total",
-        "NON-FINANCIAL - Total",
-        "Other - Total",
-    ]
+    formatted_backlogs["PRO Backlogs"] = formatted_backlogs["QueueKey"].map(
+        backlog_summary_unique.set_index("QueueKey")["PRO Backlogs"]
+    ).fillna(0).astype(int)
 
-    # --- Step 5. Roll up totals safely per category (positional slicing logic) ---
+    formatted_backlogs["QC Backlogs"] = formatted_backlogs["QueueKey"].map(
+        backlog_summary_unique.set_index("QueueKey")["QC Backlogs"]
+    ).fillna(0).astype(int)
+
+    # --- Step 4: Define category headers (explicit based on layout_type) ---
+    if layout_type.upper() == "HNW":
+        category_headers = [
+            "INSTITUTIONAL - Total",
+            "APP INVESTMENT - Total",
+            "UNITED FINANCIALS - Total",
+            "Other - Total",
+        ]
+    else:
+        category_headers = [
+            "FINANCIAL - Total",
+            "QUASI NON-FINANCIAL - Total",
+            "NON-FINANCIAL - Total",
+            "Other - Total",
+        ]
+
+
+    # --- Step 5: Compute category totals (position-based) ---
     queue_list = list(formatted_backlogs["QueueName"])
 
     for i, q in enumerate(queue_list):
         if q in category_headers:
-            # find where the next category header or grand total starts
+            # find next category or grand total
             next_index = None
             for j in range(i + 1, len(queue_list)):
-                if (
-                    queue_list[j] in category_headers
-                    or queue_list[j] == "Other - Total"
-                    or queue_list[j] == "Grand Total by Queue:"
-                ):
+                if queue_list[j] in category_headers or queue_list[j] == "Grand Total by Queue:":
                     next_index = j
                     break
 
-            # slice rows between this header and the next header
             if next_index:
                 child_rows = formatted_backlogs.iloc[i + 1:next_index]
             else:
                 child_rows = formatted_backlogs.iloc[i + 1:]
 
-            # Sum PRO and QC backlogs of child rows
-            pro_sum = child_rows["PRO Backlogs"].sum()
-            qc_sum = child_rows["QC Backlogs"].sum()
+            formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "PRO Backlogs"] = child_rows["PRO Backlogs"].sum()
+            formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "QC Backlogs"] = child_rows["QC Backlogs"].sum()
 
-            # Write totals to category header
-            formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "PRO Backlogs"] = pro_sum
-            formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "QC Backlogs"] = qc_sum
-
-    # --- Step 6. Compute Grand Total (sum of category totals) ---
-    grand_total_rows = formatted_backlogs[
+    # --- Step 6: Compute Grand Total ---
+    total_rows = formatted_backlogs[
         formatted_backlogs["QueueName"].isin(category_headers + ["Other - Total"])
     ]
-    grand_pro = grand_total_rows["PRO Backlogs"].sum()
-    grand_qc = grand_total_rows["QC Backlogs"].sum()
+    grand_pro = total_rows["PRO Backlogs"].sum()
+    grand_qc = total_rows["QC Backlogs"].sum()
 
     formatted_backlogs.loc[
         formatted_backlogs["QueueName"].str.strip().str.lower() == "grand total by queue:",
         ["PRO Backlogs", "QC Backlogs"]
     ] = [grand_pro, grand_qc]
 
-    # --- Step 7. Cleanup ---
+    # --- Step 7: Final cleanup ---
     formatted_backlogs = formatted_backlogs.fillna(0)
-    formatted_backlogs = formatted_backlogs.drop(columns=["Category"], errors="ignore")
-
-    # Handle duplicate columns if they exist
-    if "QueueName" in formatted_backlogs.columns and "CI GTA & GDC Queue Volumes" in formatted_backlogs.columns:
-        if formatted_backlogs["QueueName"].equals(formatted_backlogs["CI GTA & GDC Queue Volumes"]):
-            formatted_backlogs = formatted_backlogs.drop(columns=["QueueName"])
+    formatted_backlogs = formatted_backlogs[["QueueName", "PRO Backlogs", "QC Backlogs"]]
+    formatted_backlogs.reset_index(drop=True, inplace=True)
 
     return formatted_backlogs
 
@@ -460,22 +513,57 @@ def process_layout_sheet(sheet_name, category_headers):
         .str.replace(r"\s+", " ", regex=True)
     )
 
+    # Normalize both Queue and QueueName for matching
     pro_entries = data_dump_df[~data_dump_df["Queue"].astype(str).str.endswith("QC", na=False)].copy()
-    pro_counts = pro_entries.groupby("Queue")["Document ID"].nunique().to_dict()
-    pro_locked_counts = pro_entries[pro_entries["Lock Status"] == "LOCKED"].groupby("Queue")["Document ID"].nunique().to_dict()
+    pro_entries["QueueKey"] = (
+        pro_entries["Queue"].astype(str)
+        .str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.strip()
+)
 
-    output_df["PRO Queue"] = output_df["QueueName"].map(pro_counts).fillna(0).astype(int)
-    output_df["User Locked PRO"] = output_df["QueueName"].map(pro_locked_counts).fillna(0).astype(int)
+    # Locked PRO entries
+    pro_locked_entries = pro_entries[pro_entries["Lock Status"] == "LOCKED"].copy()
+    pro_locked_entries["QueueKey"] = pro_locked_entries["QueueKey"]
+
+    # Count total and locked PROs
+    pro_counts = pro_entries.groupby("QueueKey")["Document ID"].nunique().to_dict()
+    pro_locked_counts = pro_locked_entries.groupby("QueueKey")["Document ID"].nunique().to_dict()
+
+    # Normalize layout queue names
+    output_df["QueueKey"] = (
+        output_df["QueueName"].astype(str)
+        .str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.strip()
+    )
+
+    # Map counts
+    output_df["PRO Queue"] = output_df["QueueKey"].map(pro_counts).fillna(0).astype(int)
+    output_df["User Locked PRO"] = output_df["QueueKey"].map(pro_locked_counts).fillna(0).astype(int)
 
 
+    # --- Normalize QC queues (BaseQueueKey)
     qc_entries = data_dump_df[data_dump_df["Queue"].astype(str).str.endswith("QC", na=False)].copy()
-    qc_entries["BaseQueue"] = qc_entries["Queue"].astype(str).str.replace(r"QC$", "", regex=True).str.strip()
+    qc_entries["BaseQueueKey"] = (
+        qc_entries["Queue"].astype(str)
+        .str.replace(r"QC$", "", regex=True)
+        .str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.strip()
+    )
 
-    qc_counts = qc_entries.groupby("BaseQueue")["Document ID"].nunique().to_dict()
-    qc_locked_counts = qc_entries[qc_entries["Lock Status"] == "LOCKED"].groupby("BaseQueue")["Document ID"].nunique().to_dict()
+    # Count QC volumes
+    qc_counts = qc_entries.groupby("BaseQueueKey")["Document ID"].nunique().to_dict()
 
-    output_df["QC Queue"] = output_df["QueueName"].map(qc_counts).fillna(0).astype(int)
-    output_df["User Locked QC"] = output_df["QueueName"].map(qc_locked_counts).fillna(0).astype(int)
+    # Count locked QC volumes (using same normalized key)
+    qc_locked_entries = qc_entries[qc_entries["Lock Status"] == "LOCKED"].copy()
+    qc_locked_counts = qc_locked_entries.groupby("BaseQueueKey")["Document ID"].nunique().to_dict()
+
+    # Map both to layout queues
+    output_df["QC Queue"] = output_df["QueueKey"].map(qc_counts).fillna(0).astype(int)
+    output_df["User Locked QC"] = output_df["QueueKey"].map(qc_locked_counts).fillna(0).astype(int)
+
 
 
     processed_counts = data_dump_df.groupby("Queue")["Document ID"].nunique().to_dict()
@@ -526,18 +614,23 @@ def process_layout_sheet(sheet_name, category_headers):
             output_df["QueueName"].map(reso_pf_counts).fillna(0).astype(int)
         )
 
-    # Compute Aging per queue (max minutes since Entry Date)
-    aging_map = map_queue_aging(data_dump_df)
+    # Compute Aging counts separately for PRO and QC queues (older than 60 mins)
+    aging_pro_map, aging_qc_map = map_queue_aging(data_dump_df)
 
-    output_df["Aging"] = (
-        output_df["QueueName"]
-        .astype(str)
-        .str.strip()
-        .map(aging_map)
+    output_df["Aging_PRO"] = (
+        output_df["QueueKey"]
+        .map(aging_pro_map)
         .fillna(0)
-        .round(0)
         .astype(int)
     )
+
+    output_df["Aging_QC"] = (
+        output_df["QueueKey"]
+        .map(aging_qc_map)
+        .fillna(0)
+        .astype(int)
+    )
+
 
     reso_completed_map = map_resolutions_completed(reso_completed_path)
 
@@ -565,8 +658,11 @@ def process_layout_sheet(sheet_name, category_headers):
         "PRO Queue", "QC Queue", "User Locked PRO", "User Locked QC",
         "Processed Volumes", "Reso Queue",
         "PRO Personal Folders", "RESO Personal Folders",
-        "Accepted Volumes", "QC'ed Volumes", "Resolutions Completed Volumes", "Aging"
+        "Accepted Volumes", "QC'ed Volumes",
+        "Resolutions Completed Volumes",
+        "Aging_PRO", "Aging_QC"
     ] if c in output_df.columns]
+
 
     fte_target_map = load_fte_target_times()
 
@@ -874,47 +970,15 @@ df_announcements = process_announcements()
 df_capacity = process_capacity_table(df_gdc)
 
 # --- Backlogs ---
-df_backlogs = compute_backlogs(data_dump_df, layout_path)
+df_backlogs_gdc = compute_backlogs(data_dump_df, layout_path, layout_type="GDC", layout_sheet="Backlogs_GDC")
+df_backlogs_hnw = compute_backlogs(data_dump_df, layout_path, layout_type="HNW", layout_sheet="Backlogs_HNW")
 
-# Standardize column name for consistency
-if "QueueName" not in df_backlogs.columns and "CI GTA & GDC Queue Volumes" in df_backlogs.columns:
-    df_backlogs = df_backlogs.rename(columns={"CI GTA & GDC Queue Volumes": "QueueName"})
+# --- Ensure column names are consistent before filtering ---
+if "QueueName" not in df_backlogs_gdc.columns and "CI GTA & GDC Queue Volumes" in df_backlogs_gdc.columns:
+    df_backlogs_gdc.rename(columns={"CI GTA & GDC Queue Volumes": "QueueName"}, inplace=True)
 
-# Match the format of the Dashboard layout
-# Load template layout columns from the "Backlogs" sheet if available
-try:
-    layout_wb = pd.ExcelFile(layout_path)
-    layout_backlog_df = pd.read_excel(layout_wb, sheet_name="Backlogs", header=None)
-
-    header_row_idx = layout_backlog_df[layout_backlog_df.apply(
-        lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(),
-        axis=1
-    )].index[0]
-
-    layout_backlog_columns = layout_backlog_df.iloc[header_row_idx].tolist()
-    layout_backlog_columns = [str(c).strip().replace("\xa0", " ") for c in layout_backlog_columns]
-
-    formatted_backlogs = layout_backlog_df.iloc[header_row_idx+1:].reset_index(drop=True)
-    formatted_backlogs.columns = layout_backlog_columns
-
-    if "QueueName" not in formatted_backlogs.columns:
-        formatted_backlogs.insert(0, "QueueName", layout_backlog_df.iloc[header_row_idx+1:, 0].reset_index(drop=True))
-
-    formatted_backlogs["QueueName"] = formatted_backlogs["QueueName"].astype(str).str.strip()
-
-    # Map actual backlog values
-    formatted_backlogs["PRO Backlogs"] = formatted_backlogs["QueueName"].map(
-        df_backlogs.set_index("QueueName")["PRO Backlogs"]
-    ).fillna(0).astype(int)
-
-    formatted_backlogs["QC Backlogs"] = formatted_backlogs["QueueName"].map(
-        df_backlogs.set_index("QueueName")["QC Backlogs"]
-    ).fillna(0).astype(int)
-
-    df_backlogs_final = formatted_backlogs
-except Exception as e:
-    print("Warning: Could not format Backlogs sheet:", e)
-    df_backlogs_final = df_backlogs
+if "QueueName" not in df_backlogs_hnw.columns and "CI GTA & GDC Queue Volumes" in df_backlogs_hnw.columns:
+    df_backlogs_hnw.rename(columns={"CI GTA & GDC Queue Volumes": "QueueName"}, inplace=True)
 
 last_updated_records = [
     ["CC Full View of GDC+GTA screen1", "Digital Dashboard Layout + Requirements.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
@@ -938,14 +1002,16 @@ output_path = rf"C:\Users\edmichaeljoil.fajard\Documents\CBPS - Command Centre D
 # Add unique ID columns to GDC, HNW, and Backlogs
 df_gdc.insert(0, "Row_ID", range(1, len(df_gdc) + 1))
 df_hnw.insert(0, "Row_ID", range(1, len(df_hnw) + 1))
-df_backlogs_final.insert(0, "Row_ID", range(1, len(df_backlogs_final) + 1))
+df_backlogs_gdc.insert(0, "Row_ID", range(1, len(df_backlogs_gdc) + 1))
+df_backlogs_hnw.insert(0, "Row_ID", range(1, len(df_backlogs_hnw) + 1))
 
 with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
     df_gdc.to_excel(writer, index=False, sheet_name="CC Full View of GDC+GTA screen1")
     df_hnw.to_excel(writer, index=False, sheet_name="CC Full View of HNW Qs1bis")
     df_users.to_excel(writer, index=False, sheet_name="USERS_Productivity screen2")
     df_exec.to_excel(writer, index=False, sheet_name="Executive View")
-    df_backlogs_final.to_excel(writer, index=False, sheet_name="Backlogs")
+    df_backlogs_gdc.to_excel(writer, index=False, sheet_name="Backlogs_GDC")
+    df_backlogs_hnw.to_excel(writer, index=False, sheet_name="Backlogs_HNW")
     df_calendar.to_excel(writer, index=False, sheet_name="Calendar of Events")
     df_announcements.to_excel(writer, index=False, sheet_name="Announcements")
     df_last_updated.to_excel(writer, index=False, sheet_name="Last Updated")
@@ -992,7 +1058,8 @@ df_dict = {
     "users_productivity": sanitize_columns(df_users),
     "executive_view": sanitize_columns(df_exec),
     "calendar_of_events": sanitize_columns(df_calendar),
-    "backlogs": sanitize_columns(df_backlogs_final),
+    "backlogs_gdc": sanitize_columns(df_backlogs_gdc),
+    "backlogs_hnw": sanitize_columns(df_backlogs_hnw),
     "capacity": sanitize_columns(df_capacity),
     "announcements": sanitize_columns(df_announcements),
     "last_updated": sanitize_columns(df_last_updated)
@@ -1019,6 +1086,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
