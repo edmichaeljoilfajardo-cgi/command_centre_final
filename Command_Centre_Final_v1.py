@@ -25,6 +25,8 @@ calendar_path = os.path.join(UPLOAD_DIR, "Calendar of Events.xlsx")
 
 prod_extract_path = os.path.join(UPLOAD_DIR, "Productivity Extract.csv")
 
+last_updated_txt_path = os.path.join(UPLOAD_DIR, "last_updated.txt")
+
 def clean_columns(df):
     df.columns = (
         df.columns.astype(str)
@@ -56,6 +58,28 @@ data_dump_df["Lock Status"] = (
     .str.upper()
     .replace({"Y": "LOCKED", "LOCKED": "LOCKED"})
 )
+
+def get_last_modified_utc_from_txt(txt_path):
+    """
+    Reads 'last_updated.txt' and extracts the Modified (UTC) timestamp.
+    Returns it as a string in format 'YYYY-MM-DD HH:MM:SS', or current time if not found.
+    """
+    try:
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        match = re.search(r"Modified \(UTC\):\s*([0-9T:\-Z]+)", content)
+        if match:
+            # Parse and convert 'T' + 'Z' into standard datetime
+            timestamp_str = match.group(1).replace('T', ' ').replace('Z', '')
+            dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            print("Warning: 'Modified (UTC)' not found in last_updated.txt. Using current time.")
+            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        print(f"Warning: Could not read last_updated.txt — {e}")
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def map_personal_folder_counts_pro(folder_df):
     """
@@ -980,15 +1004,17 @@ if "QueueName" not in df_backlogs_gdc.columns and "CI GTA & GDC Queue Volumes" i
 if "QueueName" not in df_backlogs_hnw.columns and "CI GTA & GDC Queue Volumes" in df_backlogs_hnw.columns:
     df_backlogs_hnw.rename(columns={"CI GTA & GDC Queue Volumes": "QueueName"}, inplace=True)
 
+last_modified_utc = get_last_modified_utc_from_txt(last_updated_txt_path)
+
 last_updated_records = [
-    ["CC Full View of GDC+GTA screen1", "Digital Dashboard Layout + Requirements.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["CC Full View of HNW Qs1bis", "Digital Dashboard Layout + Requirements.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["Executive View", "Derived from GDC + HNW tables", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["USERS_Productivity screen2", "Digital Dashboard Layout + Requirements.xlsx / BOA - Time Off Work.xlsm", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["Capacity", "Attendance.xlsx / Work Queue Team Mapping.xlsx / CIF BOA Official Scorecard.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["Backlogs", "Digital Dashboard Queue Names Data Dump.xlsx / Digital Dashboard Layout + Requirements.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["Calendar of Events", "Calendar of Events.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["Announcements", "Calendar of Events.xlsx", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["CC Full View of GDC+GTA screen1", "Digital Dashboard Layout + Requirements.xlsx", last_modified_utc],
+    ["CC Full View of HNW Qs1bis", "Digital Dashboard Layout + Requirements.xlsx", last_modified_utc],
+    ["Executive View", "Derived from GDC + HNW tables", last_modified_utc],
+    ["USERS_Productivity screen2", "Digital Dashboard Layout + Requirements.xlsx / BOA - Time Off Work.xlsm", last_modified_utc],
+    ["Capacity", "Attendance.xlsx / Work Queue Team Mapping.xlsx / CIF BOA Official Scorecard.xlsx", last_modified_utc],
+    ["Backlogs", "Digital Dashboard Queue Names Data Dump.xlsx / Digital Dashboard Layout + Requirements.xlsx", last_modified_utc],
+    ["Calendar of Events", "Calendar of Events.xlsx", last_modified_utc],
+    ["Announcements", "Calendar of Events.xlsx", last_modified_utc],
 ]
 
 df_last_updated = pd.DataFrame(
@@ -1086,10 +1112,4 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
-
-
-
-
-
-
 
