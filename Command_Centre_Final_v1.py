@@ -222,70 +222,100 @@ def map_queue_aging(data_dump_df):
         return {}, {}
 
 # Helper to compute PRO and QC Backlogs (with totals by category)
+def map_queue_to_category(layout_path, layout_sheet):
+    """
+    Builds a mapping of each queue name to its parent category section
+    (Financial / Quasi Non-Financial / Non-Financial / Other)
+    from the specified layout sheet.
+    """
+    layout_wb = pd.ExcelFile(layout_path)
+    layout_df = pd.read_excel(layout_wb, sheet_name=layout_sheet, header=None)
+
+    # Find the header row containing "PRO Backlogs"
+    header_row_idx = layout_df[
+        layout_df.apply(lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(), axis=1)
+    ].index[0]
+
+    # Extract only the queue name column (below header)
+    layout_df = layout_df.iloc[header_row_idx + 1:, [0]]
+    layout_df.columns = ["QueueName"]
+    layout_df["QueueName"] = layout_df["QueueName"].astype(str).str.strip()
+
+    categories = {}
+    current_cat = None
+    for q in layout_df["QueueName"]:
+        q_clean = q.strip().upper()
+        if q_clean in [
+            "FINANCIAL - TOTAL",
+            "QUASI NON-FINANCIAL - TOTAL",
+            "NON-FINANCIAL - TOTAL",
+            "OTHER - TOTAL",
+        ]:
+            current_cat = q_clean
+        elif q_clean == "GRAND TOTAL BY QUEUE:":
+            continue
+        elif current_cat is not None:
+            categories[q.strip()] = current_cat
+    return categories
+
 def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Backlogs"):
     """
     Compute PRO and QC Backlogs with full queue details and accurate category totals.
-    Includes threshold rules:
-      - Financial: backlog if Entry Date ≠ today
-      - Non-Financial:
+    Rules:
+      - Financial: backlog if Entry Date ≠ today (for both PRO & QC)
+      - Quasi / Non-Financial:
           PRO backlog if Entry Date + 1 business day < today
-          QC backlog if Entry Date + 2 business days < today
+          QC  backlog if Entry Date + 2 business days < today
     """
     import pytz
     est = pytz.timezone("US/Eastern")
 
+    # Build queue → category map from layout
+    queue_category_map = map_queue_to_category(layout_path, layout_sheet)
+
+    # --- Prepare base DataFrame ---
     df = data_dump_df.copy()
     df["Entry Date"] = pd.to_datetime(df["Entry Date"], errors="coerce")
-
-    # Localize to EST if timezone-naive
-    df["Entry Date"] = df["Entry Date"].apply(
-        lambda x: est.localize(x) if pd.notna(x) and x.tzinfo is None else x
-    )
-
     df["Queue"] = df["Queue"].astype(str).str.strip()
     df["Is_QC"] = df["Queue"].str.endswith("QC", na=False)
 
-    today = pd.Timestamp.now(tz=est).normalize()
+    today_est = pd.Timestamp.now(tz=est).normalize().date()
 
-    # Determine Financial/Non-Financial by layout type
-    if layout_type.upper() == "HNW":
-        financial_keywords = ["INSTITUTIONAL", "APP INVESTMENT", "UNITED"]
-    else:
-        financial_keywords = ["FINANCIAL"]
-
-    def get_category(queue):
-        q = str(queue).upper()
-        for word in financial_keywords:
-            if word in q:
-                return "FINANCIAL"
-        return "NON-FINANCIAL"
-
-    df["CategoryType"] = df["Queue"].apply(get_category)
-
-    # Apply threshold logic
+    # --- Backlog logic per queue ---
     backlog_flags = []
     for _, row in df.iterrows():
         entry = row["Entry Date"]
+        queue_name = str(row["Queue"]).strip()
+        is_qc = row["Is_QC"]
+
         if pd.isna(entry):
             backlog_flags.append(False)
             continue
 
-        cat = row["CategoryType"]
-        is_qc = row["Is_QC"]
+        entry_date = pd.to_datetime(entry).date()
+        # Find layout category (default Non-Financial)
+        category = queue_category_map.get(queue_name, "NON-FINANCIAL - TOTAL").upper()
 
-        if cat == "FINANCIAL":
-            backlog_flags.append(entry.normalize() < today)
+        # --- Apply rules ---
+        if "FINANCIAL" in category and "QUASI" not in category:
+            # Financial (Processing & QC): backlog if entry date ≠ today
+            backlog_flags.append(entry_date != today_est)
+
+        elif "QUASI" in category or "NON-FINANCIAL" in category:
+            # Quasi/Non-Financial
+            if not is_qc:  # Processing
+                threshold_date = (pd.Timestamp(entry) + pd.offsets.BDay(1)).date()
+            else:           # QC
+                threshold_date = (pd.Timestamp(entry) + pd.offsets.BDay(2)).date()
+            backlog_flags.append(today_est > threshold_date)
+
         else:
-            if not is_qc:  # PRO
-                threshold_date = entry + pd.offsets.BDay(1)
-            else:  # QC
-                threshold_date = entry + pd.offsets.BDay(2)
-            backlog_flags.append(threshold_date < today)
+            backlog_flags.append(False)
 
     df["IsBacklog"] = backlog_flags
     backlog_df = df[df["IsBacklog"]].copy()
 
-    # Compute raw backlog counts
+    # --- Count Backlogs ---
     pro_backlogs = (
         backlog_df[~backlog_df["Is_QC"]]
         .groupby("Queue")["Document ID"]
@@ -308,20 +338,15 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
         how="outer"
     ).fillna(0)
 
-    backlog_summary["PRO Backlogs"] = backlog_summary["PRO Backlogs"].astype(int)
-    backlog_summary["QC Backlogs"] = backlog_summary["QC Backlogs"].astype(int)
     backlog_summary["QueueKey"] = (
         backlog_summary["QueueName"].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
     )
 
-    # Deduplicate queue keys by summing if repeated
     backlog_summary = (
-        backlog_summary
-        .groupby("QueueKey", as_index=False)[["PRO Backlogs", "QC Backlogs"]]
-        .sum(numeric_only=True)
+        backlog_summary.groupby("QueueKey", as_index=False)[["PRO Backlogs", "QC Backlogs"]].sum()
     )
-    
-    # Load layout
+
+    # --- Load layout ---
     layout_wb = pd.ExcelFile(layout_path)
     layout_df = pd.read_excel(layout_wb, sheet_name=layout_sheet, header=None)
     header_row_idx = layout_df[
@@ -332,22 +357,13 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
     formatted_backlogs = layout_df.iloc[header_row_idx + 1:].reset_index(drop=True)
     formatted_backlogs.columns = layout_columns
 
-    # Identify queue column
-    queue_col = None
-    for col in formatted_backlogs.columns:
-        if "queue" in col.lower():
-            queue_col = col
-            break
-    if not queue_col:
-        queue_col = "QueueName"
-
+    queue_col = next((c for c in formatted_backlogs.columns if "queue" in c.lower()), "QueueName")
     formatted_backlogs.rename(columns={queue_col: "QueueName"}, inplace=True)
-    formatted_backlogs["QueueName"] = formatted_backlogs["QueueName"].astype(str).str.strip()
+
     formatted_backlogs["QueueKey"] = (
         formatted_backlogs["QueueName"].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
     )
 
-    # Map backlog counts
     formatted_backlogs["PRO Backlogs"] = formatted_backlogs["QueueKey"].map(
         backlog_summary.set_index("QueueKey")["PRO Backlogs"]
     ).fillna(0).astype(int)
@@ -356,7 +372,7 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
         backlog_summary.set_index("QueueKey")["QC Backlogs"]
     ).fillna(0).astype(int)
 
-    # --- Recalculate totals by category ---
+    # --- Category Totals ---
     if layout_type.upper() == "HNW":
         category_headers = [
             "INSTITUTIONAL - Total",
@@ -376,54 +392,23 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
 
     for i, q in enumerate(queue_list):
         if q in category_headers:
-            next_index = None
-            for j in range(i + 1, len(queue_list)):
-                if queue_list[j] in category_headers or queue_list[j] == "Grand Total by Queue:":
-                    next_index = j
-                    break
-            if next_index:
-                child_rows = formatted_backlogs.iloc[i + 1:next_index]
-            else:
-                child_rows = formatted_backlogs.iloc[i + 1:]
-
+            next_index = next(
+                (j for j in range(i + 1, len(queue_list))
+                 if queue_list[j] in category_headers or queue_list[j] == "Grand Total by Queue:"),
+                None
+            )
+            child_rows = formatted_backlogs.iloc[i + 1:next_index] if next_index else formatted_backlogs.iloc[i + 1:]
             formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "PRO Backlogs"] = child_rows["PRO Backlogs"].sum()
             formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "QC Backlogs"] = child_rows["QC Backlogs"].sum()
 
-    # Compute "Other - Total" section totals
-    other_rows = [
-        "Other - Total",
-        "Incoming Fax Queue",
-        "Incoming Email Queue",
-        "Index Queue",
-        "Doc Translation",
-        "Reso Validation",
-        "RMA",
-        "United Doc Translation"
-    ]
-    other_totals = formatted_backlogs.loc[
-        formatted_backlogs["QueueName"].isin(other_rows[1:])
-    ][["PRO Backlogs", "QC Backlogs"]].sum(numeric_only=True)
-
-    for col in ["PRO Backlogs", "QC Backlogs"]:
-        formatted_backlogs.loc[formatted_backlogs["QueueName"] == "Other - Total", col] = other_totals[col]
-
-    # Compute Grand Total
-    total_rows = formatted_backlogs[
-        formatted_backlogs["QueueName"].isin(category_headers)
-    ]
-    grand_pro = total_rows["PRO Backlogs"].sum()
-    grand_qc = total_rows["QC Backlogs"].sum()
-
+    # --- Grand Total ---
+    total_rows = formatted_backlogs[formatted_backlogs["QueueName"].isin(category_headers)]
     formatted_backlogs.loc[
         formatted_backlogs["QueueName"].str.strip().str.lower() == "grand total by queue:",
         ["PRO Backlogs", "QC Backlogs"]
-    ] = [grand_pro, grand_qc]
+    ] = total_rows[["PRO Backlogs", "QC Backlogs"]].sum().values
 
-    formatted_backlogs = formatted_backlogs.fillna(0)
-    formatted_backlogs = formatted_backlogs[["QueueName", "PRO Backlogs", "QC Backlogs"]]
-    formatted_backlogs.reset_index(drop=True, inplace=True)
-
-    return formatted_backlogs
+    return formatted_backlogs[["QueueName", "PRO Backlogs", "QC Backlogs"]].fillna(0).reset_index(drop=True)
 
 # Helper to load and summarize Productivity Extract
 def load_productivity_extract():
@@ -1173,5 +1158,6 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
