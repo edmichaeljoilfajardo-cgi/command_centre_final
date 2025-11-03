@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime
 import re
 from sqlalchemy import create_engine
+import pytz
 
 # Folder where Flask API saves uploaded files
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -59,27 +60,40 @@ data_dump_df["Lock Status"] = (
     .replace({"Y": "LOCKED", "LOCKED": "LOCKED"})
 )
 
-def get_last_modified_utc_from_txt(txt_path):
+def get_last_modified_est_from_txt(txt_path):
     """
-    Reads 'last_updated.txt' and extracts the Modified (UTC) timestamp.
-    Returns it as a string in format 'YYYY-MM-DD HH:MM:SS', or current time if not found.
+    Reads 'last_updated.txt', extracts 'Modified (PHT)' or 'Updated on (PHT)',
+    converts it to EST (Eastern Standard Time), and returns as 'YYYY-MM-DD HH:MM:SS'.
     """
     try:
         with open(txt_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        match = re.search(r"Modified \(UTC\):\s*([0-9T:\-Z]+)", content)
+        # Prefer "Modified (PHT)" over "Updated on (PHT)" if both exist
+        match = re.search(r"Modified \(PHT\):\s*([0-9:\-\s]+)", content)
+        if not match:
+            match = re.search(r"Updated on \(PHT\):\s*([0-9:\-\s]+)", content)
+
         if match:
-            # Parse and convert 'T' + 'Z' into standard datetime
-            timestamp_str = match.group(1).replace('T', ' ').replace('Z', '')
-            dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
+            timestamp_str = match.group(1).strip()
+            # Parse as naive datetime in PHT timezone
+            pht_tz = pytz.timezone("Asia/Manila")
+            est_tz = pytz.timezone("US/Eastern")
+
+            dt_pht = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            dt_pht = pht_tz.localize(dt_pht)
+            dt_est = dt_pht.astimezone(est_tz)
+
+            return dt_est.strftime("%Y-%m-%d %H:%M:%S")
         else:
-            print("Warning: 'Modified (UTC)' not found in last_updated.txt. Using current time.")
-            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print("Warning: No '(PHT)' timestamp found in last_updated.txt. Using current time (EST).")
+            est_tz = pytz.timezone("US/Eastern")
+            return datetime.now(est_tz).strftime("%Y-%m-%d %H:%M:%S")
+
     except Exception as e:
         print(f"Warning: Could not read last_updated.txt — {e}")
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        est_tz = pytz.timezone("US/Eastern")
+        return datetime.now(est_tz).strftime("%Y-%m-%d %H:%M:%S")
 
 def map_personal_folder_counts_pro(folder_df):
     """
@@ -211,21 +225,67 @@ def map_queue_aging(data_dump_df):
 def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Backlogs"):
     """
     Compute PRO and QC Backlogs with full queue details and accurate category totals.
-    Includes all queues from the layout.
+    Includes threshold rules:
+      - Financial: backlog if Entry Date ≠ today
+      - Non-Financial:
+          PRO backlog if Entry Date + 1 business day < today
+          QC backlog if Entry Date + 2 business days < today
     """
+    import pytz
+    est = pytz.timezone("US/Eastern")
 
-    # --- Step 1: Compute raw backlog counts ---
     df = data_dump_df.copy()
     df["Entry Date"] = pd.to_datetime(df["Entry Date"], errors="coerce")
 
-    today = pd.Timestamp.now().normalize()
-    # Count only entries with Entry Date before today
-    backlog_df = df[df["Entry Date"].dt.normalize() < today]
+    # Localize to EST if timezone-naive
+    df["Entry Date"] = df["Entry Date"].apply(
+        lambda x: est.localize(x) if pd.notna(x) and x.tzinfo is None else x
+    )
 
-    backlog_df["Queue"] = backlog_df["Queue"].astype(str).str.strip()
-    backlog_df["Is_QC"] = backlog_df["Queue"].str.endswith("QC", na=False)
+    df["Queue"] = df["Queue"].astype(str).str.strip()
+    df["Is_QC"] = df["Queue"].str.endswith("QC", na=False)
 
-    # PRO (non-QC queues)
+    today = pd.Timestamp.now(tz=est).normalize()
+
+    # Determine Financial/Non-Financial by layout type
+    if layout_type.upper() == "HNW":
+        financial_keywords = ["INSTITUTIONAL", "APP INVESTMENT", "UNITED"]
+    else:
+        financial_keywords = ["FINANCIAL"]
+
+    def get_category(queue):
+        q = str(queue).upper()
+        for word in financial_keywords:
+            if word in q:
+                return "FINANCIAL"
+        return "NON-FINANCIAL"
+
+    df["CategoryType"] = df["Queue"].apply(get_category)
+
+    # Apply threshold logic
+    backlog_flags = []
+    for _, row in df.iterrows():
+        entry = row["Entry Date"]
+        if pd.isna(entry):
+            backlog_flags.append(False)
+            continue
+
+        cat = row["CategoryType"]
+        is_qc = row["Is_QC"]
+
+        if cat == "FINANCIAL":
+            backlog_flags.append(entry.normalize() < today)
+        else:
+            if not is_qc:  # PRO
+                threshold_date = entry + pd.offsets.BDay(1)
+            else:  # QC
+                threshold_date = entry + pd.offsets.BDay(2)
+            backlog_flags.append(threshold_date < today)
+
+    df["IsBacklog"] = backlog_flags
+    backlog_df = df[df["IsBacklog"]].copy()
+
+    # Compute raw backlog counts
     pro_backlogs = (
         backlog_df[~backlog_df["Is_QC"]]
         .groupby("Queue")["Document ID"]
@@ -233,7 +293,6 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
         .reset_index(name="PRO Backlogs")
     )
 
-    # QC (ending with QC)
     qc_backlogs = (
         backlog_df[backlog_df["Is_QC"]]
         .assign(BaseQueue=lambda x: x["Queue"].str.replace(r"QC$", "", regex=True).str.strip())
@@ -251,27 +310,18 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
 
     backlog_summary["PRO Backlogs"] = backlog_summary["PRO Backlogs"].astype(int)
     backlog_summary["QC Backlogs"] = backlog_summary["QC Backlogs"].astype(int)
-
-    # Normalize for consistent key matching
     backlog_summary["QueueKey"] = (
-        backlog_summary["QueueName"].astype(str)
-        .str.upper()
-        .str.replace(r"\s+", "", regex=True)
-        .str.strip()
+        backlog_summary["QueueName"].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
     )
 
-    # --- Step 2: Load layout (Backlogs sheet) ---
+    # Load layout
     layout_wb = pd.ExcelFile(layout_path)
     layout_df = pd.read_excel(layout_wb, sheet_name=layout_sheet, header=None)
-
-
     header_row_idx = layout_df[
         layout_df.apply(lambda row: row.astype(str).str.contains("PRO Backlogs", case=False).any(), axis=1)
     ].index[0]
 
-    layout_columns = layout_df.iloc[header_row_idx].tolist()
-    layout_columns = [str(c).strip().replace("\xa0", " ") for c in layout_columns]
-
+    layout_columns = [str(c).strip().replace("\xa0", " ") for c in layout_df.iloc[header_row_idx].tolist()]
     formatted_backlogs = layout_df.iloc[header_row_idx + 1:].reset_index(drop=True)
     formatted_backlogs.columns = layout_columns
 
@@ -284,31 +334,22 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
     if not queue_col:
         queue_col = "QueueName"
 
-
     formatted_backlogs.rename(columns={queue_col: "QueueName"}, inplace=True)
     formatted_backlogs["QueueName"] = formatted_backlogs["QueueName"].astype(str).str.strip()
-
     formatted_backlogs["QueueKey"] = (
-        formatted_backlogs["QueueName"].astype(str)
-        .str.upper()
-        .str.replace(r"\s+", "", regex=True)
-        .str.strip()
+        formatted_backlogs["QueueName"].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
     )
 
-    # --- Step 3: Map backlog counts for each queue ---
-    backlog_summary_unique = (
-        backlog_summary.groupby("QueueKey", as_index=False)[["PRO Backlogs", "QC Backlogs"]].sum()
-    )
-
+    # Map backlog counts
     formatted_backlogs["PRO Backlogs"] = formatted_backlogs["QueueKey"].map(
-        backlog_summary_unique.set_index("QueueKey")["PRO Backlogs"]
+        backlog_summary.set_index("QueueKey")["PRO Backlogs"]
     ).fillna(0).astype(int)
 
     formatted_backlogs["QC Backlogs"] = formatted_backlogs["QueueKey"].map(
-        backlog_summary_unique.set_index("QueueKey")["QC Backlogs"]
+        backlog_summary.set_index("QueueKey")["QC Backlogs"]
     ).fillna(0).astype(int)
 
-    # --- Step 4: Define category headers (explicit based on layout_type) ---
+    # --- Recalculate totals by category ---
     if layout_type.upper() == "HNW":
         category_headers = [
             "INSTITUTIONAL - Total",
@@ -324,19 +365,15 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
             "Other - Total",
         ]
 
-
-    # --- Step 5: Compute category totals (position-based) ---
     queue_list = list(formatted_backlogs["QueueName"])
 
     for i, q in enumerate(queue_list):
         if q in category_headers:
-            # find next category or grand total
             next_index = None
             for j in range(i + 1, len(queue_list)):
                 if queue_list[j] in category_headers or queue_list[j] == "Grand Total by Queue:":
                     next_index = j
                     break
-
             if next_index:
                 child_rows = formatted_backlogs.iloc[i + 1:next_index]
             else:
@@ -345,9 +382,27 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
             formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "PRO Backlogs"] = child_rows["PRO Backlogs"].sum()
             formatted_backlogs.loc[formatted_backlogs["QueueName"] == q, "QC Backlogs"] = child_rows["QC Backlogs"].sum()
 
-    # --- Step 6: Compute Grand Total ---
+    # Compute "Other - Total" section totals
+    other_rows = [
+        "Other - Total",
+        "Incoming Fax Queue",
+        "Incoming Email Queue",
+        "Index Queue",
+        "Doc Translation",
+        "Reso Validation",
+        "RMA",
+        "United Doc Translation"
+    ]
+    other_totals = formatted_backlogs.loc[
+        formatted_backlogs["QueueName"].isin(other_rows[1:])
+    ][["PRO Backlogs", "QC Backlogs"]].sum(numeric_only=True)
+
+    for col in ["PRO Backlogs", "QC Backlogs"]:
+        formatted_backlogs.loc[formatted_backlogs["QueueName"] == "Other - Total", col] = other_totals[col]
+
+    # Compute Grand Total
     total_rows = formatted_backlogs[
-        formatted_backlogs["QueueName"].isin(category_headers + ["Other - Total"])
+        formatted_backlogs["QueueName"].isin(category_headers)
     ]
     grand_pro = total_rows["PRO Backlogs"].sum()
     grand_qc = total_rows["QC Backlogs"].sum()
@@ -357,7 +412,6 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
         ["PRO Backlogs", "QC Backlogs"]
     ] = [grand_pro, grand_qc]
 
-    # --- Step 7: Final cleanup ---
     formatted_backlogs = formatted_backlogs.fillna(0)
     formatted_backlogs = formatted_backlogs[["QueueName", "PRO Backlogs", "QC Backlogs"]]
     formatted_backlogs.reset_index(drop=True, inplace=True)
@@ -1004,17 +1058,17 @@ if "QueueName" not in df_backlogs_gdc.columns and "CI GTA & GDC Queue Volumes" i
 if "QueueName" not in df_backlogs_hnw.columns and "CI GTA & GDC Queue Volumes" in df_backlogs_hnw.columns:
     df_backlogs_hnw.rename(columns={"CI GTA & GDC Queue Volumes": "QueueName"}, inplace=True)
 
-last_modified_utc = get_last_modified_utc_from_txt(last_updated_txt_path)
+last_modified_est = get_last_modified_est_from_txt(last_updated_txt_path)
 
 last_updated_records = [
-    ["CC Full View of GDC+GTA screen1", "Digital Dashboard Layout + Requirements.xlsx", last_modified_utc],
-    ["CC Full View of HNW Qs1bis", "Digital Dashboard Layout + Requirements.xlsx", last_modified_utc],
-    ["Executive View", "Derived from GDC + HNW tables", last_modified_utc],
-    ["USERS_Productivity screen2", "Digital Dashboard Layout + Requirements.xlsx / BOA - Time Off Work.xlsm", last_modified_utc],
-    ["Capacity", "Attendance.xlsx / Work Queue Team Mapping.xlsx / CIF BOA Official Scorecard.xlsx", last_modified_utc],
-    ["Backlogs", "Digital Dashboard Queue Names Data Dump.xlsx / Digital Dashboard Layout + Requirements.xlsx", last_modified_utc],
-    ["Calendar of Events", "Calendar of Events.xlsx", last_modified_utc],
-    ["Announcements", "Calendar of Events.xlsx", last_modified_utc],
+    ["CC Full View of GDC+GTA screen1", "Digital Dashboard Layout + Requirements.xlsx", last_modified_est],
+    ["CC Full View of HNW Qs1bis", "Digital Dashboard Layout + Requirements.xlsx", last_modified_est],
+    ["Executive View", "Derived from GDC + HNW tables", last_modified_est],
+    ["USERS_Productivity screen2", "Digital Dashboard Layout + Requirements.xlsx / BOA - Time Off Work.xlsm", last_modified_est],
+    ["Capacity", "Attendance.xlsx / Work Queue Team Mapping.xlsx / CIF BOA Official Scorecard.xlsx", last_modified_est],
+    ["Backlogs", "Digital Dashboard Queue Names Data Dump.xlsx / Digital Dashboard Layout + Requirements.xlsx", last_modified_est],
+    ["Calendar of Events", "Calendar of Events.xlsx", last_modified_est],
+    ["Announcements", "Calendar of Events.xlsx", last_modified_est],
 ]
 
 df_last_updated = pd.DataFrame(
