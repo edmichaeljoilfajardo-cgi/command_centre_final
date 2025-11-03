@@ -314,6 +314,13 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
         backlog_summary["QueueName"].astype(str).str.upper().str.replace(r"\s+", "", regex=True)
     )
 
+    # Deduplicate queue keys by summing if repeated
+    backlog_summary = (
+        backlog_summary
+        .groupby("QueueKey", as_index=False)[["PRO Backlogs", "QC Backlogs"]]
+        .sum(numeric_only=True)
+    )
+    
     # Load layout
     layout_wb = pd.ExcelFile(layout_path)
     layout_df = pd.read_excel(layout_wb, sheet_name=layout_sheet, header=None)
@@ -1166,4 +1173,5 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
