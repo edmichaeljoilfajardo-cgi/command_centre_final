@@ -783,19 +783,33 @@ def process_layout_sheet(sheet_name, category_headers):
                 output_df.loc[output_df["QueueName"] == q, "FTE Required"] = child_rows["FTE Required"].sum()
 
 
+    # Define explicit special mappings (except Index Queue, which is handled separately)
     special_map = {
         "Doc Translation": "DocTranslation",
         "Reso Validation": "ResolutionValidation",
-        "RMA": "ResolutionManagerApproval",
-        "Index Queue": "General Index"
+        "RMA": "ResolutionManagerApproval"
     }
+
+    # Count rows (not unique IDs) per special queue
     special_counts = (
         data_dump_df[data_dump_df["Queue"].isin(special_map.values())]
-        .groupby("Queue")["Document ID"].nunique().to_dict()
+        .groupby("Queue")["Document ID"].count().to_dict()
     )
+
+    # Count all queues that start with "Index" (case-insensitive)
+    index_counts = (
+        data_dump_df[data_dump_df["Queue"].astype(str).str.match(r"(?i)^index")]
+        .shape[0]
+    )
+
+    # Assign to layout rows
     for label, queue_val in special_map.items():
         if label in output_df["QueueName"].values:
             output_df.loc[output_df["QueueName"] == label, "PRO Queue"] = special_counts.get(queue_val, 0)
+
+    # Now set Index Queue total
+    if "Index Queue" in output_df["QueueName"].values:
+        output_df.loc[output_df["QueueName"] == "Index Queue", "PRO Queue"] = index_counts
 
     other_section_rows = [
         "Other - Total",
@@ -1162,6 +1176,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
