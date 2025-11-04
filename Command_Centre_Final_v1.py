@@ -267,7 +267,6 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
           PRO backlog if Entry Date + 1 business day < today
           QC  backlog if Entry Date + 2 business days < today
     """
-    import pytz
     est = pytz.timezone("US/Eastern")
 
     # Build queue → category map from layout
@@ -279,7 +278,7 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
     df["Queue"] = df["Queue"].astype(str).str.strip()
     df["Is_QC"] = df["Queue"].str.endswith("QC", na=False)
 
-    today_est = pd.Timestamp.now(tz=est).normalize().date()
+    today_est = datetime.now(pytz.utc).astimezone(est).date()
 
     # --- Backlog logic per queue ---
     backlog_flags = []
@@ -293,16 +292,20 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
             continue
 
         entry_date = pd.to_datetime(entry).date()
-        # Find layout category (default Non-Financial)
-        category = queue_category_map.get(queue_name, "NON-FINANCIAL - TOTAL").upper()
+        # Normalize queue for category lookup (remove QC suffix)
+        base_queue = re.sub(r'QC$', '', queue_name, flags=re.IGNORECASE).strip()
+        category = queue_category_map.get(base_queue, "NON-FINANCIAL - TOTAL").upper()
 
-        # --- Apply rules ---
-        if "FINANCIAL" in category and "QUASI" not in category:
-            # Financial (Processing & QC): backlog if entry date ≠ today
+
+        # --- Apply category-based backlog rules ---
+        category = category.upper().strip()
+
+        if category == "FINANCIAL - TOTAL":
+            # Financial: Processing and QC share the same rule
             backlog_flags.append(entry_date != today_est)
 
-        elif "QUASI" in category or "NON-FINANCIAL" in category:
-            # Quasi/Non-Financial
+        elif category in ["QUASI NON-FINANCIAL - TOTAL", "NON-FINANCIAL - TOTAL"]:
+            # Non-Financial (includes Quasi): different rules for PRO and QC
             if not is_qc:  # Processing
                 threshold_date = (pd.Timestamp(entry) + pd.offsets.BDay(1)).date()
             else:           # QC
@@ -311,6 +314,7 @@ def compute_backlogs(data_dump_df, layout_path, layout_type="", layout_sheet="Ba
 
         else:
             backlog_flags.append(False)
+
 
     df["IsBacklog"] = backlog_flags
     backlog_df = df[df["IsBacklog"]].copy()
@@ -1158,6 +1162,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
