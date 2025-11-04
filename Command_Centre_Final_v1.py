@@ -628,7 +628,7 @@ def process_layout_sheet(sheet_name, category_headers):
     )
 
     # Count QC volumes
-    qc_counts = qc_entries.groupby("BaseQueueKey")["Document ID"].nunique().to_dict()
+    qc_counts = qc_entries.groupby("BaseQueueKey")["Document ID"].count().to_dict()
 
     # Count locked QC volumes (using same normalized key)
     qc_locked_entries = qc_entries[qc_entries["Lock Status"] == "LOCKED"].copy()
@@ -1162,6 +1162,7 @@ save_to_databases(df_dict, sqlite_engine, postgres_engine)
 print(f"SQLite database saved to {sqlite_path}")
 if postgres_engine:
     print("PostgreSQL export completed successfully.")
+
 
 
 
